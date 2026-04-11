@@ -25,6 +25,69 @@ _client = BinanceFuturesClient(
     testnet=os.getenv("BINANCE_TESTNET", "true").strip().lower() == "true",
 )
 
+OPEN_POSITION_FIELDS = [
+    "position_id",
+    "order_id",
+    "symbol",
+    "side",
+    "entry",
+    "qty",
+    "sl",
+    "tp",
+    "rr",
+    "score",
+    "tf_context",
+    "setup_type",
+    "setup_reason",
+    "opened_at",
+    "updated_at",
+    "status",
+    "live_price",
+    "pnl_pct",
+    "net_pnl_pct",
+    "net_pnl_usdt",
+    "fees_usdt",
+    "sl_order_id",
+    "tp_order_id",
+    "protection_armed",
+]
+
+OPEN_ORDER_FIELDS = [
+    "order_id",
+    "symbol",
+    "side",
+    "entry_zone_low",
+    "entry_zone_high",
+    "entry_trigger",
+    "sl",
+    "tp",
+    "rr",
+    "score",
+    "tf_context",
+    "setup_type",
+    "setup_reason",
+    "created_at",
+    "updated_at",
+    "expires_at",
+    "status",
+    "live_price",
+    "zone_touched",
+    "alarm_touched_sent",
+    "alarm_near_trigger_sent",
+    "last_alarm_at",
+    "exchange_order_placed",
+    "exchange_order_id",
+]
+
+EVENT_LOG_FIELDS = [
+    "time",
+    "event",
+    "symbol",
+    "side",
+    "details",
+    "score",
+]
+
 
 # =========================================================
 # MODE
@@ -125,6 +188,13 @@ def new_local_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def normalize_row(row: Dict[str, Any], fieldnames: List[str]) -> Dict[str, Any]:
+    out = {}
+    for key in fieldnames:
+        out[key] = row.get(key, "")
+    return out
+
+
 # =========================================================
 # LOGGING
 # =========================================================
@@ -149,18 +219,22 @@ def log_message(msg: str, file: str) -> None:
         print(f"[{utc_ts()}] LOG_WRITE_FAIL file={file} error={e} original={msg}", flush=True)
 
 
-def append_csv_row(path: str, row: Dict[str, Any]) -> None:
+def append_csv_row(path: str, row: Dict[str, Any], fieldnames: Optional[List[str]] = None) -> None:
     if not path:
         return
 
     ensure_parent_dir(path)
 
+    if fieldnames is None:
+        fieldnames = list(row.keys())
+
+    row = normalize_row(row, fieldnames)
+
     file_exists = os.path.exists(path)
     file_empty = (not file_exists) or os.path.getsize(path) == 0
-    fieldnames = list(row.keys())
 
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         if file_empty:
             writer.writeheader()
         writer.writerow(row)
@@ -180,7 +254,7 @@ def log_event(event: str, symbol: str, side: str, details: str, score: int) -> N
     path = event_log_file()
 
     try:
-        append_csv_row(path, row)
+        append_csv_row(path, row, EVENT_LOG_FIELDS)
     except Exception as e:
         fallback = getattr(CONFIG.TRADE, "ORDER_LOG_FILE", "logs/order.log")
         log_message(
@@ -230,26 +304,27 @@ def read_csv_rows(path: str) -> List[Dict[str, Any]]:
         return []
 
 
-def write_csv_rows(path: str, rows: List[Dict[str, Any]]) -> None:
+def write_csv_rows(path: str, rows: List[Dict[str, Any]], fieldnames: Optional[List[str]] = None) -> None:
     if not path:
         return
 
     ensure_parent_dir(path)
     tmp_path = f"{path}.tmp"
 
-    if not rows:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write("")
-            f.flush()
-        os.replace(tmp_path, path)
-        return
+    if fieldnames is None:
+        if rows:
+            fieldnames = list(rows[0].keys())
+        else:
+            fieldnames = []
 
-    fieldnames = list(rows[0].keys())
+    normalized_rows = [normalize_row(r, fieldnames) for r in rows]
 
     with open(tmp_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+        if fieldnames:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            if normalized_rows:
+                writer.writerows(normalized_rows)
         f.flush()
 
     os.replace(tmp_path, path)
@@ -267,7 +342,7 @@ def get_open_orders() -> List[Dict[str, Any]]:
 
 
 def write_open_orders(rows: List[Dict[str, Any]]) -> None:
-    write_csv_rows(open_orders_file(), rows)
+    write_csv_rows(open_orders_file(), rows, OPEN_ORDER_FIELDS)
 
 
 def save_open_orders(rows: List[Dict[str, Any]]) -> None:
@@ -276,12 +351,12 @@ def save_open_orders(rows: List[Dict[str, Any]]) -> None:
 
 def append_open_order(row: Dict[str, Any]) -> None:
     rows = load_open_orders()
-    rows.append(row)
+    rows.append(normalize_row(row, OPEN_ORDER_FIELDS))
     write_open_orders(rows)
 
 
 def append_closed_order(row: Dict[str, Any]) -> None:
-    append_csv_row(closed_orders_file(), row)
+    append_csv_row(closed_orders_file(), row, OPEN_ORDER_FIELDS)
 
 
 def get_open_positions() -> List[Dict[str, Any]]:
@@ -293,7 +368,7 @@ def load_open_positions() -> List[Dict[str, Any]]:
 
 
 def write_open_positions(rows: List[Dict[str, Any]]) -> None:
-    write_csv_rows(open_positions_file(), rows)
+    write_csv_rows(open_positions_file(), rows, OPEN_POSITION_FIELDS)
 
 
 def save_open_positions(rows: List[Dict[str, Any]]) -> None:
@@ -302,7 +377,7 @@ def save_open_positions(rows: List[Dict[str, Any]]) -> None:
 
 def append_open_position(row: Dict[str, Any]) -> None:
     rows = get_open_positions()
-    rows.append(row)
+    rows.append(normalize_row(row, OPEN_POSITION_FIELDS))
     write_open_positions(rows)
 
 
@@ -311,12 +386,18 @@ def append_open_positions(row: Dict[str, Any]) -> None:
 
 
 def append_closed_position(row: Dict[str, Any]) -> None:
-    append_csv_row(closed_positions_file(), row)
+    append_csv_row(closed_positions_file(), row, OPEN_POSITION_FIELDS)
 
 
 def remove_open_position(symbol: str) -> None:
     rows = get_open_positions()
     rows = [r for r in rows if r.get("symbol") != symbol]
+    write_open_positions(rows)
+
+
+def remove_open_position_by_id(position_id: str) -> None:
+    rows = get_open_positions()
+    rows = [r for r in rows if str(r.get("position_id", "")) != str(position_id)]
     write_open_positions(rows)
 
 
@@ -351,7 +432,7 @@ def order_expired(order: Dict[str, Any]) -> bool:
 # =========================================================
 # ORDER / POSITION HELPERS
 # =========================================================
-def price_in_zone(side: str, live_price: float, zone_low: float, zone_high: float) -> bool:
+def price_in_zone(live_price: float, zone_low: float, zone_high: float) -> bool:
     low = min(zone_low, zone_high)
     high = max(zone_low, zone_high)
     return low <= live_price <= high
@@ -375,7 +456,7 @@ def should_trigger_entry(order: Dict[str, Any], live_price: float) -> bool:
 def update_zone_touch(order: Dict[str, Any], live_price: float) -> bool:
     zone_low = to_float(order.get("entry_zone_low"))
     zone_high = to_float(order.get("entry_zone_high"))
-    touched_now = price_in_zone(order.get("side", ""), live_price, zone_low, zone_high)
+    touched_now = price_in_zone(live_price, zone_low, zone_high)
     if touched_now:
         order["zone_touched"] = "1"
     return touched_now
@@ -384,7 +465,7 @@ def update_zone_touch(order: Dict[str, Any], live_price: float) -> bool:
 def update_zone_touched(order: Dict[str, Any], live_price: float) -> str:
     zone_low = to_float(order.get("entry_zone_low"))
     zone_high = to_float(order.get("entry_zone_high"))
-    if price_in_zone(order.get("side", ""), live_price, zone_low, zone_high):
+    if price_in_zone(live_price, zone_low, zone_high):
         return "1"
     return order.get("zone_touched", "0")
 
@@ -394,8 +475,11 @@ def set_alarm_mark(order: Dict[str, Any], key: str) -> None:
     order["last_alarm_at"] = utc_ts()
 
 
-def can_send_alarm(order: Dict[str, Any]) -> bool:
-    return True
+def can_send_alarm(order: Dict[str, Any], cooldown_sec: int = 60) -> bool:
+    last_alarm_at = parse_utc_ts(order.get("last_alarm_at", ""))
+    if last_alarm_at is None:
+        return True
+    return (datetime.utcnow() - last_alarm_at).total_seconds() >= cooldown_sec
 
 
 def trigger_alarm(msg: str) -> None:
@@ -404,7 +488,7 @@ def trigger_alarm(msg: str) -> None:
 
 def make_order_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
     now = utc_ts()
-    return {
+    return normalize_row({
         "order_id": new_local_id(),
         "symbol": candidate["symbol"],
         "side": candidate["side"],
@@ -429,17 +513,18 @@ def make_order_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "last_alarm_at": "",
         "exchange_order_placed": "0",
         "exchange_order_id": "",
-    }
+    }, OPEN_ORDER_FIELDS)
 
 
-def make_position_row_from_order(order: Dict[str, Any], entry: float) -> Dict[str, Any]:
+def make_position_row_from_order(order: Dict[str, Any], entry: float, qty: float = 0.0) -> Dict[str, Any]:
     now = utc_ts()
-    return {
-        "position_id": order.get("order_id", new_local_id()),
+    return normalize_row({
+        "position_id": order.get("position_id") or order.get("order_id", new_local_id()),
         "order_id": order.get("exchange_order_id", ""),
         "symbol": order["symbol"],
         "side": order["side"],
         "entry": fmt_price(entry),
+        "qty": str(qty),
         "sl": order["sl"],
         "tp": order["tp"],
         "rr": order.get("rr", ""),
@@ -452,7 +537,13 @@ def make_position_row_from_order(order: Dict[str, Any], entry: float) -> Dict[st
         "status": "OPEN_POSITION",
         "live_price": fmt_price(entry),
         "pnl_pct": "0.0000",
-    }
+        "net_pnl_pct": "0.0000",
+        "net_pnl_usdt": "0.0000",
+        "fees_usdt": "0.0000",
+        "sl_order_id": "",
+        "tp_order_id": "",
+        "protection_armed": "0",
+    }, OPEN_POSITION_FIELDS)
 
 
 # =========================================================
