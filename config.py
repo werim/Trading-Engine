@@ -1,189 +1,221 @@
-from dataclasses import dataclass, field
-from typing import List, Dict
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from dataclasses import dataclass
+from env import load_env
+
+load_env()
 
 
 @dataclass
-class AdaptiveModeConfig:
-    ENABLED: bool = True
-    SCORE_FILE: str = "score.txt"
-    HOT_SCORE_THRESHOLD: int = 2
-    COLD_SCORE_THRESHOLD: int = -2
+class EngineConfig:
+    EXECUTION_MODE: str = "REAL"      # PAPER | REAL
+    STRATEGY_MODE: str = "BALANCED"   # AGGRESSIVE | BALANCED | SAFE | AUTO
+
+    @property
+    def MODE(self) -> str:
+        return self.EXECUTION_MODE
 
 
 @dataclass
-class ModeNormal:
-    MAX_PENDING_ORDERS: int = 4
-    MIN_SIGNAL_SCORE: int = 2
+class TradeConfig:
 
+    # =========================
+    # TIMEFRAMES
+    # =========================
+    HTF_INTERVAL: str = "1d"
+    MTF_INTERVAL: str = "4h"
+    LTF_INTERVAL: str = "1h"
+    MICRO_INTERVAL: str = "15m"
 
-@dataclass
-class ModeDefensive:
-    MAX_PENDING_ORDERS: int = 2
-    MIN_SIGNAL_SCORE: int = 3
-
-
-@dataclass
-class Config:
-    MODE: str = "HYBRID"
-    TEST_MODE: bool = True
-
-    SYMBOLS: List[str] = field(default_factory=lambda: [])
-    TOP_N: int = 50
-    USE_MARK_PRICE: bool = False
     KLINE_LIMIT: int = 220
 
-    OPEN_ORDERS_CSV: str = "open_orders.csv"
-    CLOSED_ORDERS_CSV: str = "closed_orders.csv"
-    HISTORY_ORDERS_CSV: str = "history_orders.csv"
+    # =========================
+    # INDICATORS
+    # =========================
+    ATR_PERIOD: int = 14
+    EMA_FAST: int = 20
+    EMA_MID: int = 50
 
-    OPEN_POSITIONS_CSV: str = "open_positions.csv"
-    CLOSED_POSITIONS_CSV: str = "closed_positions.csv"
-    HISTORY_POSITIONS_CSV: str = "history_positions.csv"
+    # =========================
+    # STRUCTURE / SETUP
+    # =========================
 
-    EVENT_LOG_CSV: str = "event_log.csv"
-    SCORE_FILE: str = "score.txt"
+    MIN_NET_PROFIT_PCT: float = 0.0035  # 0.35%
+    MIN_NET_PROFIT_USDT: float = 0.35  # minimum expected net dollars per trade
+    MIN_NET_RR: float = 1.25  # fee-adjusted RR floor
 
-    ENTRY_INTERVAL: str = "1h"
-    ENTRY_CONFIRM_INTERVAL: str = "15m"
-    STRUCTURE_INTERVAL: str = "4h"
-    TREND_INTERVAL: str = "1d"
-    MACRO_INTERVAL: str = "1w"
+    NET_PROFIT_MODE: bool = True
 
-    USE_4H_FILTER: bool = False
-    USE_1D_FILTER: bool = True
-    USE_1W_FILTER: bool = True
+    BINANCE_FEE_MAKER: float = 0.0002  # 0.02%
+    BINANCE_FEE_TAKER: float = 0.0004  # 0.04%
 
-    MIN_SIGNAL_SCORE: int = 2
-    BLOCK_RANGE_TREND: bool = True
-    STRICT_TREND_ALIGNMENT: bool = False
+    # how your entry/exit usually execute
+    ENTRY_FEE_RATE: float = 0.0004  # stop-limit can still behave like taker often
+    EXIT_FEE_RATE: float = 0.0004  # tp/sl execution usually assume taker for safety
 
-    MIN_ATR_PCT: float = 0.004
-    MIN_PRICE: float = 0.000001
+    # minimum net profit after commissions
+    MIN_NET_PROFIT_PCT: float = 0.003  # 0.30%
 
-    MAX_SL_DISTANCE_PCT: float = 5.5
-    MIN_TP_DISTANCE_PCT: float = 1.2
+    # optional safety cushion for spread/slippage
+    EXTRA_COST_PCT: float = 0.0005  # 0.05%
 
-    REGRESSION_FLAT_ANGLE: float = 0.9
-    REGRESSION_TREND_ANGLE: float = 2.2
+    SWING_LOOKBACK: int = 6
+    BREAKOUT_LOOKBACK: int = 20
 
-    ENTRY_ATR_OFFSET_MULT: float = 0.0
-    SL_ATR_BUFFER_MULT: float = 0.20
-    TP_RR_MULT: float = 1.8
+    PULLBACK_ZONE_BUFFER_PCT: float = 0.0015
+    BREAKOUT_BUFFER_PCT: float = 0.0010
+    SL_BUFFER_PCT: float = 0.0010
+    TP_R_MULTIPLIER: float = 2.0
 
-    ZONE_LOOKBACK_1H: int = 120
-    ZONE_PIVOT_LEFT: int = 2
-    ZONE_PIVOT_RIGHT: int = 2
-    ZONE_CLUSTER_ATR_MULT: float = 0.35
-    ZONE_MIN_TOUCHES: int = 2
-    ZONE_MAX_COUNT: int = 8
+    # legacy / compatibility
+    ZONE_PADDING_PCT: float = 0.0015
+    SL_BUFFER_ATR_MULTIPLIER: float = 0.8
+    TP_ATR_MULTIPLIER: float = 2.2
 
-    PULLBACK_NEAR_ZONE_ATR_MULT: float = 0.30
-    BREAKOUT_BODY_ATR_MULT: float = 0.25
-    RETEST_ZONE_ATR_MULT: float = 0.35
+    # =========================
+    # RISK / FILTERS
+    # =========================
+    RR_MIN: float = 1.6
+    RR_DEFAULT: float = 2.0
 
-    ENTRY_CONFIRMATION_BUFFER_ATR_MULT: float = 0.05
-    BREAKOUT_CONFIRMATION_BUFFER_ATR_MULT: float = 0.05
+    MIN_SL_PCT: float = 0.002
+    MAX_SL_PCT: float = 0.05
+    RISK_PER_TRADE_PCT: float = 0.01
 
-    USE_VOLUME_CONFIRMATION: bool = False
-    VOLUME_SPIKE_MULT: float = 1.20
+    MIN_SCORE: int = 2
+    BLOCK_DUPLICATE_SYMBOL_STATE: bool = False
 
-    MIN_LEVEL_UPDATE_PCT: float = 0.25
-    MAX_ENTRY_DRIFT_PCT: float = 3.0
-    CANCEL_IF_TP_PASSED_BEFORE_FILL: bool = True
-    RECALCULATE_OPEN_ORDERS: bool = True
-    ORDER_EXPIRY_HOURS: int = 12
-    BLOCK_EXISTING_SYMBOL_STATE: bool = True
+    # =========================
+    # SCAN / ORDER ENGINE
+    # =========================
+    DEFAULT_SCAN_TOP_VOL: int = 100
+    SAFE_SCAN_TOP_VOL: int = 50
 
-    PRICE_POLL_SECONDS: int = 5
-    POSITION_CHECK_INTERVAL: int = 5
+    MAX_OPEN_ORDERS: int = 30
+    MAX_CANDIDATES_PER_CYCLE: int = 30
 
-    ADAPTIVE_MODE_ENABLED: bool = True
-    ADAPTIVE_MODE: AdaptiveModeConfig = field(default_factory=AdaptiveModeConfig)
+    REPRICE_THRESHOLD_PCT: float = 0.0015
 
-    MODE_NORMAL: Dict[str, int] = field(default_factory=lambda: {
-        "MAX_PENDING_ORDERS": 4,
-        "MIN_SIGNAL_SCORE": 2,
-    })
+    ORDER_USDT_SIZE: float = 100.0
+    ENTRY_LONG_BUFFER_PCT: float = 0.0003
+    ENTRY_SHORT_BUFFER_PCT: float = 0.0003
+    WORKING_TYPE: str = "CONTRACT_PRICE"
 
-    MODE_DEFENSIVE: Dict[str, int] = field(default_factory=lambda: {
-        "MAX_PENDING_ORDERS": 2,
-        "MIN_SIGNAL_SCORE": 3,
-    })
+    ALLOW_REPLACE_ARMED_ORDER: bool = True
+    ALLOW_SIDE_FLIP_REPLACEMENT: bool = True
+
+    # =========================
+    # FILES / LOGS
+    # =========================
+    ORDER_LOG_FILE: str = "logs/order.log"
+    POSITION_LOG_FILE: str = "logs/position.log"
+    EVENT_LOG_FILE = "logs/event_log.csv"
+
+    WS_URL: str = "wss://fstream.binance.com/ws/!ticker@arr"
+
+    PAPER_OPEN_ORDERS_FILE: str = "data/open_orders.csv"
+    PAPER_CLOSED_ORDERS_FILE: str = "data/closed_orders.csv"
+    PAPER_OPEN_POSITIONS_FILE: str = "data/open_positions.csv"
+    PAPER_CLOSED_POSITIONS_FILE: str = "data/closed_positions.csv"
+
+    REAL_OPEN_ORDERS_FILE: str = "data/real_open_orders.csv"
+    REAL_CLOSED_ORDERS_FILE: str = "data/real_closed_orders.csv"
+    REAL_OPEN_POSITIONS_FILE: str = "data/real_open_positions.csv"
+    REAL_CLOSED_POSITIONS_FILE: str = "data/real_closed_positions.csv"
+
+
+@dataclass
+class AlarmConfig:
+    TOUCHED_ORDER_ENABLED: bool = True
+    NEAR_TRIGGER_ENABLED: bool = True
+    NEAR_TRIGGER_PCT: float = 0.002
+    TOUCHED_EMOJI: str = "🟡"
+    TRIGGER_EMOJI: str = "🟠"
+
+
+@dataclass
+class WSSSLConfig:
+    VERIFY_CERT: bool = True
+    ALLOW_INSECURE_FALLBACK: bool = True
+
+
+@dataclass
+class AdaptiveConfig:
+    SCORE_FILE: str = "data/score.txt"
+
+    AUTO_SAFE_THRESHOLD: int = -3
+    AUTO_BALANCED_THRESHOLD: int = 2
+    # score <= -3 => SAFE
+    # -2 .. 1     => BALANCED
+    # >= 2        => AGGRESSIVE
+
+
+class Config:
+    ENGINE = EngineConfig()
+    TRADE = TradeConfig()
+    ALARM = AlarmConfig()
+    WS_SSL = WSSSLConfig()
+    ADAPTIVE = AdaptiveConfig()
+
+
+    def get_mode_settings(self, score: int = 0) -> dict:
+        strategy_mode = self.ENGINE.STRATEGY_MODE.upper()
+
+        if strategy_mode == "AGGRESSIVE":
+            return {
+                "NAME": "AGGRESSIVE",
+                "MIN_SIGNAL_SCORE": 2,
+                "MAX_OPEN_POSITIONS": 10,
+                "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,   # 200
+            }
+
+        if strategy_mode == "BALANCED":
+            return {
+                "NAME": "BALANCED",
+                "MIN_SIGNAL_SCORE": 4,
+                "MAX_OPEN_POSITIONS": 7,
+                "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,   # 200
+            }
+
+        if strategy_mode == "SAFE":
+            return {
+                "NAME": "SAFE",
+                "MIN_SIGNAL_SCORE": 4,
+                "MAX_OPEN_POSITIONS": 4,
+                "MAX_SYMBOLS_SCAN": self.TRADE.SAFE_SCAN_TOP_VOL,      # 50
+            }
+
+        if strategy_mode == "AUTO":
+            if score <= self.ADAPTIVE.AUTO_SAFE_THRESHOLD:
+                return {
+                    "NAME": "SAFE",
+                    "MIN_SIGNAL_SCORE": 3,
+                    "MAX_OPEN_POSITIONS": 4,
+                    "MAX_SYMBOLS_SCAN": self.TRADE.SAFE_SCAN_TOP_VOL,  # 50
+                }
+
+            if score >= self.ADAPTIVE.AUTO_BALANCED_THRESHOLD:
+                return {
+                    "NAME": "AGGRESSIVE",
+                    "MIN_SIGNAL_SCORE": 2,
+                    "MAX_OPEN_POSITIONS": 10,
+                    "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,  # 200
+                }
+
+            return {
+                "NAME": "BALANCED",
+                "MIN_SIGNAL_SCORE": 4,
+                "MAX_OPEN_POSITIONS": 7,
+                "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,   # 200
+            }
+
+        return {
+            "NAME": "BALANCED",
+            "MIN_SIGNAL_SCORE": 4,
+            "MAX_OPEN_POSITIONS": 7,
+            "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,       # 200
+        }
 
 
 CONFIG = Config()
-
-TOP_N = CONFIG.TOP_N
-USE_MARK_PRICE = CONFIG.USE_MARK_PRICE
-KLINE_LIMIT = CONFIG.KLINE_LIMIT
-
-OPEN_ORDERS_CSV = CONFIG.OPEN_ORDERS_CSV
-CLOSED_ORDERS_CSV = CONFIG.CLOSED_ORDERS_CSV
-HISTORY_ORDERS_CSV = CONFIG.HISTORY_ORDERS_CSV
-
-OPEN_POSITIONS_CSV = CONFIG.OPEN_POSITIONS_CSV
-CLOSED_POSITIONS_CSV = CONFIG.CLOSED_POSITIONS_CSV
-HISTORY_POSITIONS_CSV = CONFIG.HISTORY_POSITIONS_CSV
-
-EVENT_LOG_CSV = CONFIG.EVENT_LOG_CSV
-SCORE_FILE = CONFIG.SCORE_FILE
-
-ENTRY_INTERVAL = CONFIG.ENTRY_INTERVAL
-ENTRY_CONFIRM_INTERVAL = CONFIG.ENTRY_CONFIRM_INTERVAL
-STRUCTURE_INTERVAL = CONFIG.STRUCTURE_INTERVAL
-TREND_INTERVAL = CONFIG.TREND_INTERVAL
-MACRO_INTERVAL = CONFIG.MACRO_INTERVAL
-
-USE_4H_FILTER = CONFIG.USE_4H_FILTER
-USE_1D_FILTER = CONFIG.USE_1D_FILTER
-USE_1W_FILTER = CONFIG.USE_1W_FILTER
-
-MIN_SIGNAL_SCORE = CONFIG.MIN_SIGNAL_SCORE
-BLOCK_RANGE_TREND = CONFIG.BLOCK_RANGE_TREND
-STRICT_TREND_ALIGNMENT = CONFIG.STRICT_TREND_ALIGNMENT
-
-MIN_ATR_PCT = CONFIG.MIN_ATR_PCT
-MIN_PRICE = CONFIG.MIN_PRICE
-
-MAX_SL_DISTANCE_PCT = CONFIG.MAX_SL_DISTANCE_PCT
-MIN_TP_DISTANCE_PCT = CONFIG.MIN_TP_DISTANCE_PCT
-
-REGRESSION_FLAT_ANGLE = CONFIG.REGRESSION_FLAT_ANGLE
-REGRESSION_TREND_ANGLE = CONFIG.REGRESSION_TREND_ANGLE
-
-ENTRY_ATR_OFFSET_MULT = CONFIG.ENTRY_ATR_OFFSET_MULT
-SL_ATR_BUFFER_MULT = CONFIG.SL_ATR_BUFFER_MULT
-TP_RR_MULT = CONFIG.TP_RR_MULT
-
-ZONE_LOOKBACK_1H = CONFIG.ZONE_LOOKBACK_1H
-ZONE_PIVOT_LEFT = CONFIG.ZONE_PIVOT_LEFT
-ZONE_PIVOT_RIGHT = CONFIG.ZONE_PIVOT_RIGHT
-ZONE_CLUSTER_ATR_MULT = CONFIG.ZONE_CLUSTER_ATR_MULT
-ZONE_MIN_TOUCHES = CONFIG.ZONE_MIN_TOUCHES
-ZONE_MAX_COUNT = CONFIG.ZONE_MAX_COUNT
-
-PULLBACK_NEAR_ZONE_ATR_MULT = CONFIG.PULLBACK_NEAR_ZONE_ATR_MULT
-BREAKOUT_BODY_ATR_MULT = CONFIG.BREAKOUT_BODY_ATR_MULT
-RETEST_ZONE_ATR_MULT = CONFIG.RETEST_ZONE_ATR_MULT
-
-ENTRY_CONFIRMATION_BUFFER_ATR_MULT = CONFIG.ENTRY_CONFIRMATION_BUFFER_ATR_MULT
-BREAKOUT_CONFIRMATION_BUFFER_ATR_MULT = CONFIG.BREAKOUT_CONFIRMATION_BUFFER_ATR_MULT
-
-USE_VOLUME_CONFIRMATION = CONFIG.USE_VOLUME_CONFIRMATION
-VOLUME_SPIKE_MULT = CONFIG.VOLUME_SPIKE_MULT
-
-MIN_LEVEL_UPDATE_PCT = CONFIG.MIN_LEVEL_UPDATE_PCT
-MAX_ENTRY_DRIFT_PCT = CONFIG.MAX_ENTRY_DRIFT_PCT
-CANCEL_IF_TP_PASSED_BEFORE_FILL = CONFIG.CANCEL_IF_TP_PASSED_BEFORE_FILL
-RECALCULATE_OPEN_ORDERS = CONFIG.RECALCULATE_OPEN_ORDERS
-ORDER_EXPIRY_HOURS = CONFIG.ORDER_EXPIRY_HOURS
-BLOCK_EXISTING_SYMBOL_STATE = CONFIG.BLOCK_EXISTING_SYMBOL_STATE
-
-PRICE_POLL_SECONDS = CONFIG.PRICE_POLL_SECONDS
-POSITION_CHECK_INTERVAL = CONFIG.POSITION_CHECK_INTERVAL
-
-ADAPTIVE_MODE_ENABLED = CONFIG.ADAPTIVE_MODE_ENABLED
-ADAPTIVE_MODE = CONFIG.ADAPTIVE_MODE
-
-MODE_NORMAL = CONFIG.MODE_NORMAL
-MODE_DEFENSIVE = CONFIG.MODE_DEFENSIVE
