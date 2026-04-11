@@ -1,4 +1,4 @@
-# 🚀 Trading Engine !!! FOR PAPER TRADING ONLY !!!
+# 🚀 Trading Engine **!!! ON TEST PAPER TRADING ONLY !!!**
 
 A modular, algorithmic trading engine designed for **Binance Futures**, focused on **pullback & breakout strategies**, multi-timeframe analysis, and automated execution.
 
