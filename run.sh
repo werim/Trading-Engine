@@ -1,78 +1,82 @@
 #!/bin/bash
-# chmod +x *.sh
-  #./stop.sh
-  #./status.sh
-  #./run.sh
-  #./status.sh
-# tail -f order.log
-# tail -f position.log
 
-
-pkill -f "order.py" 2>/dev/null
-pkill -f "position.py" 2>/dev/null
-rm -f order.pid position.pid
-
-set -e
+set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$BASE_DIR"
+cd "$BASE_DIR" || exit 1
 
-ORDER_PID_FILE="order.pid"
-POSITION_PID_FILE="position.pid"
+mkdir -p logs data
 
-echo "Starting trading engine in: $BASE_DIR"
-
-if [ ! -d "venv" ]; then
-  echo "Creating virtual environment..."
-  python3 -m venv venv
+if [ -d "venv" ]; then
+  # shellcheck disable=SC1091
+  source venv/bin/activate
 fi
 
-echo "Activating virtual environment..."
-source venv/bin/activate
+RUN_PID_FILE=".run_pid"
+ORDER_PID_FILE=".order.pid"
+POSITION_PID_FILE=".position.pid"
+POSITION_WS_PID_FILE=".position_ws.pid"
 
-echo "Installing requirements..."
-pip install --upgrade pip
-pip install -r requirements.txt
+echo $$ > "$RUN_PID_FILE"
 
-# Eğer eski süreçler varsa temizle
-if [ -f "$ORDER_PID_FILE" ]; then
-  OLD_PID=$(cat "$ORDER_PID_FILE" 2>/dev/null || true)
-  if [ -n "$OLD_PID" ] && ps -p "$OLD_PID" > /dev/null 2>&1; then
-    echo "order.py already running with PID $OLD_PID"
-  else
-    rm -f "$ORDER_PID_FILE"
-  fi
-fi
+cleanup() {
+  echo
+  echo "🛑 Stopping engine..."
 
-if [ -f "$POSITION_PID_FILE" ]; then
-  OLD_PID=$(cat "$POSITION_PID_FILE" 2>/dev/null || true)
-  if [ -n "$OLD_PID" ] && ps -p "$OLD_PID" > /dev/null 2>&1; then
-    echo "position.py already running with PID $OLD_PID"
-  else
-    rm -f "$POSITION_PID_FILE"
-  fi
-fi
+  for f in "$ORDER_PID_FILE" "$POSITION_PID_FILE" "$POSITION_WS_PID_FILE" "$PRICE_CACHE_PID_FILE"; do
+    if [ -f "$f" ]; then
+      pid="$(cat "$f" 2>/dev/null || true)"
+      if [ -n "${pid:-}" ] && ps -p "$pid" >/dev/null 2>&1; then
+        kill "$pid" 2>/dev/null || true
+      fi
+      rm -f "$f"
+    fi
+  done
 
-# order.py başlat
-if [ ! -f "$ORDER_PID_FILE" ]; then
-  echo "Starting order.py..."
-  nohup venv/bin/python order.py > order.log 2>&1 &
-  echo $! > "$ORDER_PID_FILE"
-  echo "order.py started with PID $(cat "$ORDER_PID_FILE")"
-fi
+  rm -f "$RUN_PID_FILE"
+  wait || true
+  echo "✅ Engine stopped."
+}
 
-# position.py başlat
-if [ ! -f "$POSITION_PID_FILE" ]; then
-  echo "Starting position.py..."
-  nohup venv/bin/python position.py > position.log 2>&1 &
+trap cleanup SIGINT SIGTERM EXIT
+
+run_price_cache() {
+  echo "⚡ price_cache.py $(date)" | tee -a logs/price_cache.log
+  python3 price_cache.py >> logs/price_cache.log 2>&1 &
+  echo $! > "$PRICE_CACHE_PID_FILE"
+}
+
+run_position_ws() {
+  echo "⚡ position_ws.py $(date)" | tee -a logs/position_ws.log
+  python3 position_ws.py >> logs/position_ws.log 2>&1 &
+  echo $! > "$POSITION_WS_PID_FILE"
+}
+
+run_position() {
+  echo "⚡ position.py $(date)" | tee -a logs/position.supervisor.log
+  python3 position.py >> logs/position.log 2>&1 &
   echo $! > "$POSITION_PID_FILE"
-  echo "position.py started with PID $(cat "$POSITION_PID_FILE")"
-fi
+}
 
-echo ""
-echo "Trading engine started."
-echo "Logs:"
-echo "  order.log"
-echo "  position.log"
-echo ""
-echo "Use ./status.sh to inspect current state."
+run_cycle_loop() {
+  while true; do
+    now=$(date +%s)
+
+    # align to 5-minute grid (00,05,10...)
+    next=$(( ((now / 300) + 1) * 300 ))
+    sleep_seconds=$(( next - now ))
+
+    echo "⏳ next cycle in $sleep_seconds sec"
+    sleep "$sleep_seconds"
+
+    echo "🧠 order.py $(date)"
+    python3 order.py >> logs/order.log 2>&1
+
+    echo "⚡ position.py (post-order sync)"
+    python3 position.py >> logs/position.log 2>&1
+  done
+}
+
+echo "🚀 Trading Engine"
+# order loop stays in foreground so run.sh remains the main process
+run_cycle_loop
