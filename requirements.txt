@@ -1,2 +1,4 @@
 requests>=2.31.0
-pandas
+pandas>=2.0.0
+websocket-client>=1.8.0
+certifi
