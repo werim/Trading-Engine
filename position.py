@@ -1,467 +1,463 @@
-#position.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import os
 import time
-import uuid
-from contextlib import contextmanager
-from datetime import datetime, UTC
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
-import fcntl
-import config
+from env import load_env
+load_env()
 
+from config import CONFIG
 from utils import (
-    initialize_csvs,
-    read_csv,
-    rewrite_csv,
-    append_csv,
-    get_live_price,
-    add_score,
-    get_score,
+    append_closed_position,
+    append_open_position,
+    fmt_price,
+    get_open_positions,
+    has_existing_position,
+    is_real_mode,
+    load_open_orders,
     log_event,
-    utc_now,
-    close_order_row,
-    close_position_row,
-    history_position_row,
-    position_pnl_percent,
-    should_close_position,
+    log_message,
+    now_utc,
+    safe_get_live_price,
+    save_open_positions,
+    to_float,
+    write_open_orders,
+)
+from telegram_alert import (
+    build_open_position_message,
+    build_sl_message,
+    build_tp_message,
+    send_telegram_message,
+)
+from binance_real import BinanceFuturesClient
+
+
+client = BinanceFuturesClient(
+    api_key=os.getenv("BINANCE_API_KEY", "").strip(),
+    api_secret=os.getenv("BINANCE_API_SECRET", "").strip(),
+    testnet=os.getenv("BINANCE_TESTNET", "true").strip().lower() == "true",
 )
 
+POSITION_LOG_FILE = CONFIG.TRADE.POSITION_LOG_FILE
+WORKING_TYPE = getattr(CONFIG.TRADE, "WORKING_TYPE", "CONTRACT_PRICE")
 
-PRICE_POLL_SECONDS = getattr(config, "PRICE_POLL_SECONDS", 5)
-POSITION_CHECK_INTERVAL = getattr(config, "POSITION_CHECK_INTERVAL", PRICE_POLL_SECONDS)
-
-OPEN_ORDERS_CSV = getattr(config, "OPEN_ORDERS_CSV", "open_orders.csv")
-CLOSED_ORDERS_CSV = getattr(config, "CLOSED_ORDERS_CSV", "closed_orders.csv")
-OPEN_POSITIONS_CSV = getattr(config, "OPEN_POSITIONS_CSV", "open_positions.csv")
-CLOSED_POSITIONS_CSV = getattr(config, "CLOSED_POSITIONS_CSV", "closed_positions.csv")
-HISTORY_POSITIONS_CSV = getattr(config, "HISTORY_POSITIONS_CSV", "history_positions.csv")
-
-CANCEL_IF_TP_PASSED_BEFORE_FILL = getattr(config, "CANCEL_IF_TP_PASSED_BEFORE_FILL", True)
+ENTRY_FEE_RATE = getattr(CONFIG.TRADE, "ENTRY_FEE_RATE", 0.0004)
+EXIT_FEE_RATE = getattr(CONFIG.TRADE, "EXIT_FEE_RATE", 0.0004)
 
 
-# Local headers only. Do NOT import these from utils.
-OPEN_ORDER_HEADERS = [
-    "order_id",
-    "symbol",
-    "side",
-    "entry_zone_low",
-    "entry_zone_high",
-    "entry_trigger",
-    "sl",
-    "tp",
-    "rr",
-    "score",
-    "tf_context",
-    "setup_type",
-    "setup_reason",
-    "created_at",
-    "status",
-    "live_price",
-    "zone_touched",
-]
-
-CLOSED_ORDER_HEADERS = [
-    "order_id",
-    "symbol",
-    "side",
-    "entry_zone_low",
-    "entry_zone_high",
-    "entry_trigger",
-    "sl",
-    "tp",
-    "rr",
-    "score",
-    "tf_context",
-    "setup_type",
-    "setup_reason",
-    "created_at",
-    "closed_at",
-    "status",
-    "close_reason",
-    "close_price",
-]
-
-OPEN_POSITION_HEADERS = [
-    "position_id",
-    "order_id",
-    "symbol",
-    "side",
-    "entry",
-    "sl",
-    "tp",
-    "opened_at",
-    "trigger_price",
-    "status",
-    "live_price",
-    "pnl_pct",
-]
-
-CLOSED_POSITION_HEADERS = [
-    "position_id",
-    "order_id",
-    "symbol",
-    "side",
-    "entry",
-    "sl",
-    "tp",
-    "opened_at",
-    "closed_at",
-    "close_reason",
-    "close_price",
-    "pnl_pct",
-    "score_after_close",
-    "status",
-]
-
-HISTORY_POSITION_HEADERS = [
-    "position_id",
-    "order_id",
-    "symbol",
-    "side",
-    "entry",
-    "sl",
-    "tp",
-    "opened_at",
-    "trigger_price",
-    "status",
-]
+def calc_fees_usdt(entry: float, exit_price: float, qty: float) -> float:
+    entry_notional = entry * qty
+    exit_notional = exit_price * qty
+    return (entry_notional * ENTRY_FEE_RATE) + (exit_notional * EXIT_FEE_RATE)
 
 
-@contextmanager
-def file_lock(lock_name: str = "engine.lock"):
-    with open(lock_name, "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-
-def safe_float(value, default: float = 0.0) -> float:
-    try:
-        if value in (None, "", "None"):
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-# ---------------------------------------------------------
-# Backward compatibility helpers
-# ---------------------------------------------------------
-
-def get_order_entry_zone_low(order: dict) -> float:
-    if "entry_zone_low" in order and order.get("entry_zone_low") not in ("", None):
-        return safe_float(order.get("entry_zone_low"))
-    return safe_float(order.get("entry"))
-
-
-def get_order_entry_zone_high(order: dict) -> float:
-    if "entry_zone_high" in order and order.get("entry_zone_high") not in ("", None):
-        return safe_float(order.get("entry_zone_high"))
-    return safe_float(order.get("entry"))
-
-
-def get_order_entry_trigger(order: dict) -> float:
-    if "entry_trigger" in order and order.get("entry_trigger") not in ("", None):
-        return safe_float(order.get("entry_trigger"))
-    return safe_float(order.get("entry"))
-
-
-def get_order_zone_touched(order: dict) -> bool:
-    raw = str(order.get("zone_touched", "")).strip().lower()
-    return raw in ("1", "true", "yes", "y")
-
-
-def set_order_zone_touched(order: dict, value: bool) -> None:
-    order["zone_touched"] = "1" if value else "0"
-
-
-# ---------------------------------------------------------
-# Zone / trigger logic
-# ---------------------------------------------------------
-
-def price_inside_entry_zone(order: dict, live_price: float) -> bool:
-    low = get_order_entry_zone_low(order)
-    high = get_order_entry_zone_high(order)
-    return low <= live_price <= high
-
-
-def resolve_entry(order: dict, live_price: float) -> float:
-    if "entry" in order and str(order["entry"]).strip() != "":
-        return float(order["entry"])
-
-    zone_low = float(order["entry_zone_low"])
-    zone_high = float(order["entry_zone_high"])
-
-    if zone_low <= live_price <= zone_high:
-        return live_price
-
-    return (zone_low + zone_high) / 2.0
-
-
-def should_trigger_entry(order: dict, live_price: float) -> bool:
-    trigger = get_order_entry_trigger(order)
-    side = order["side"]
-
+def calc_real_pnl_usdt(entry: float, exit_price: float, qty: float, side: str) -> float:
+    side = str(side).upper()
     if side == "LONG":
-        return live_price >= trigger
-    return live_price <= trigger
+        gross = (exit_price - entry) * qty
+    else:
+        gross = (entry - exit_price) * qty
+    return gross - calc_fees_usdt(entry, exit_price, qty)
 
 
-def should_cancel_before_fill(order: dict, live_price: float) -> Optional[str]:
-    if not CANCEL_IF_TP_PASSED_BEFORE_FILL:
+def calc_real_pnl_pct(entry: float, exit_price: float, side: str) -> float:
+    if entry <= 0:
+        return 0.0
+    side = str(side).upper()
+    if side == "LONG":
+        gross_pct = (exit_price - entry) / entry
+    else:
+        gross_pct = (entry - exit_price) / entry
+    return (gross_pct - ENTRY_FEE_RATE - EXIT_FEE_RATE) * 100
+
+
+def get_live_price(symbol: str) -> float:
+    price = safe_get_live_price(symbol)
+    if price is None:
+        log_message(f"LIVE_PRICE_FETCH_FAIL {symbol}", POSITION_LOG_FILE)
+        return 0.0
+    return float(price)
+
+
+def get_real_position(symbol: str) -> Optional[Dict[str, Any]]:
+    try:
+        rows = client.position_risk(symbol=symbol)
+        if isinstance(rows, dict):
+            rows = [rows]
+
+        for row in rows:
+            qty = abs(float(row.get("positionAmt", 0) or 0))
+            if qty > 0:
+                return row
+        return None
+    except Exception as e:
+        log_message(f"POSITION_RISK_FAIL {symbol} error={e}", POSITION_LOG_FILE)
         return None
 
-    side = order["side"]
-    tp = safe_float(order.get("tp"))
-    sl = safe_float(order.get("sl"))
 
-    if side == "LONG":
-        if live_price >= tp:
-            return "TP_PASSED_BEFORE_FILL"
-        if live_price <= sl:
-            return "SL_PASSED_BEFORE_FILL"
-    else:
-        if live_price <= tp:
-            return "TP_PASSED_BEFORE_FILL"
-        if live_price >= sl:
-            return "SL_PASSED_BEFORE_FILL"
+def has_open_exchange_entry_order(symbol: str, exchange_order_id: str) -> bool:
+    if not exchange_order_id:
+        return False
 
-    return None
+    try:
+        orders = client.open_orders(symbol=symbol)
+        for order in orders:
+            if str(order.get("orderId", "")) == str(exchange_order_id):
+                return True
+            if str(order.get("algoId", "")) == str(exchange_order_id):
+                return True
+        return False
+    except Exception as e:
+        log_message(
+            f"OPEN_ORDER_CHECK_FAIL {symbol} exchange_order_id={exchange_order_id} error={e}",
+            POSITION_LOG_FILE,
+        )
+        return False
 
 
-def open_position_from_order(order: dict, trigger_price: float) -> dict:
+def place_stop_loss_order(pos: Dict[str, Any]) -> str:
+    symbol = pos["symbol"]
+    side = str(pos["side"]).upper()
+    sl = float(pos["sl"])
+    qty = abs(float(pos["qty"]))
+    close_side = "SELL" if side == "LONG" else "BUY"
+
+    resp = client.place_stop_market_order(
+        symbol=symbol,
+        side=close_side,
+        trigger_price=sl,
+        quantity=qty,
+        close_position=None,
+        position_side=None,
+        working_type=WORKING_TYPE,
+    )
+    return str(resp.get("algoId") or resp.get("orderId") or "")
+
+
+def place_take_profit_order(pos: Dict[str, Any]) -> str:
+    symbol = pos["symbol"]
+    side = str(pos["side"]).upper()
+    tp = float(pos["tp"])
+    qty = abs(float(pos["qty"]))
+    close_side = "SELL" if side == "LONG" else "BUY"
+
+    resp = client.place_limit_order(
+        symbol=symbol,
+        side=close_side,
+        quantity=qty,
+        price=tp,
+        time_in_force="GTC",
+        reduce_only=True,
+    )
+    return str(resp.get("orderId") or "")
+
+
+def build_position_from_order(order: Dict[str, Any], real_pos: Dict[str, Any]) -> Dict[str, Any]:
+    qty_signed = float(real_pos.get("positionAmt", 0) or 0)
+    qty = abs(qty_signed)
+    entry = float(real_pos.get("entryPrice", 0) or 0)
+
     return {
-        "position_id": str(uuid.uuid4())[:8],
-        "order_id": order["order_id"],
+        "position_id": order.get("order_id", ""),
+        "order_id": order.get("exchange_order_id", ""),
         "symbol": order["symbol"],
         "side": order["side"],
-        "entry": resolve_entry(order, trigger_price),
-        "sl": safe_float(order["sl"]),
-        "tp": safe_float(order["tp"]),
-        "opened_at": utc_now(),
-        "trigger_price": trigger_price,
+        "entry": fmt_price(entry),
+        "qty": str(qty),
+        "sl": order["sl"],
+        "tp": order["tp"],
+        "rr": order.get("rr", ""),
+        "score": order.get("score", "0"),
+        "tf_context": order.get("tf_context", ""),
+        "setup_type": order.get("setup_type", ""),
+        "setup_reason": order.get("setup_reason", ""),
+        "opened_at": now_utc(),
+        "updated_at": now_utc(),
         "status": "OPEN_POSITION",
-        "live_price": trigger_price,
-        "pnl_pct": 0.0,
+        "live_price": fmt_price(entry),
+        "pnl_pct": "0.0000",
+        "net_pnl_pct": "0.0000",
+        "net_pnl_usdt": "0.0000",
+        "fees_usdt": "0.0000",
+        "sl_order_id": "",
+        "tp_order_id": "",
+        "protection_armed": "0",
     }
 
 
-# ---------------------------------------------------------
-# Order processing
-# ---------------------------------------------------------
+def reconcile_armed_orders() -> None:
+    open_orders = load_open_orders()
+    changed = False
+    remaining_orders: List[Dict[str, Any]] = []
 
-def process_open_orders():
-    with file_lock("engine_orders.lock"):
-        open_orders = read_csv(OPEN_ORDERS_CSV)
-        open_positions = read_csv(OPEN_POSITIONS_CSV)
+    for order in open_orders:
+        status = str(order.get("status", "OPEN_ORDER"))
+        if status != "ARMED_ORDER":
+            remaining_orders.append(order)
+            continue
 
-        if not open_orders:
-            return
+        symbol = order["symbol"]
+        side = order["side"]
+        exchange_order_id = str(order.get("exchange_order_id", "")).strip()
 
-        remaining_orders = []
-        active_symbols = {p["symbol"] for p in open_positions}
+        if is_real_mode():
+            real_pos = get_real_position(symbol)
 
-        for order in open_orders:
-            symbol = order["symbol"]
-            side = order["side"]
+            if real_pos is not None:
+                if not has_existing_position(symbol):
+                    pos = build_position_from_order(order, real_pos)
 
-            if symbol in active_symbols:
-                closed = close_order_row(order, "BLOCKED_BY_EXISTING_STATE")
-                append_csv(CLOSED_ORDERS_CSV, closed, CLOSED_ORDER_HEADERS)
-                log_event("ORDER_CLOSED", symbol, side, "reason=BLOCKED_BY_EXISTING_STATE")
-                continue
+                    try:
+                        sl_id = place_stop_loss_order(pos)
+                        tp_id = place_take_profit_order(pos)
+                        pos["sl_order_id"] = sl_id
+                        pos["tp_order_id"] = tp_id
+                        pos["protection_armed"] = "1"
+                    except Exception as e:
+                        log_message(f"PROTECTION_ARM_FAIL {symbol} {side} error={e}", POSITION_LOG_FILE)
 
-            try:
-                live_price = float(get_live_price(symbol))
-                if live_price <= 0:
-                    remaining_orders.append(order)
-                    continue
+                    append_open_position(pos)
 
-                order["live_price"] = live_price
-
-                cancel_reason = should_cancel_before_fill(order, live_price)
-                if cancel_reason:
-                    closed = close_order_row(order, cancel_reason, live_price)
-                    append_csv(CLOSED_ORDERS_CSV, closed, CLOSED_ORDER_HEADERS)
-                    log_event("ORDER_CLOSED", symbol, side, f"reason={cancel_reason}")
-                    print(f"[{utc_now()}] CLOSE ORDER {symbol} reason={cancel_reason} live={live_price}", flush=True)
-                    continue
-
-                in_zone = price_inside_entry_zone(order, live_price)
-                if in_zone and not get_order_zone_touched(order):
-                    set_order_zone_touched(order, True)
-
-                touched = get_order_zone_touched(order)
-                triggered = should_trigger_entry(order, live_price)
-
-                print(
-                    f"[{utc_now()}] CHECK ORDER {symbol} {side} "
-                    f"zone=({get_order_entry_zone_low(order)},{get_order_entry_zone_high(order)}) "
-                    f"trigger={get_order_entry_trigger(order)} live={live_price} "
-                    f"in_zone={in_zone} touched={touched} triggered={triggered}",
-                    flush=True,
-                )
-
-                if touched and triggered:
-                    closed_order = close_order_row(order, "ENTRY_TRIGGERED", live_price)
-                    append_csv(CLOSED_ORDERS_CSV, closed_order, CLOSED_ORDER_HEADERS)
-
-                    position = open_position_from_order(order, live_price)
-                    open_positions.append(position)
-
-                    append_csv(
-                        HISTORY_POSITIONS_CSV,
-                        history_position_row(position),
-                        HISTORY_POSITION_HEADERS,
+                    log_message(
+                        f"ENTRY FILLED {symbol} {side} entry={pos['entry']} qty={pos['qty']} "
+                        f"sl={pos['sl']} tp={pos['tp']} exchange_order_id={exchange_order_id}",
+                        POSITION_LOG_FILE,
                     )
-
-                    active_symbols.add(symbol)
-
                     log_event(
-                        "ENTRY_TRIGGERED",
+                        "ENTRY_FILLED",
                         symbol,
                         side,
-                        (
-                            f"zone=({get_order_entry_zone_low(order)},{get_order_entry_zone_high(order)}) "
-                            f"trigger={get_order_entry_trigger(order)} fill={live_price}"
-                        ),
+                        f"entry={pos['entry']} qty={pos['qty']} sl={pos['sl']} tp={pos['tp']} "
+                        f"exchange_order_id={exchange_order_id}",
+                        int(pos.get("score", 0)),
                     )
 
-                    print(
-                        f"[{utc_now()}] OPEN POSITION {symbol} {side} "
-                        f"trigger={get_order_entry_trigger(order)} fill={live_price}",
-                        flush=True,
-                    )
-                else:
-                    remaining_orders.append(order)
+                    try:
+                        send_telegram_message(build_open_position_message(pos))
+                    except Exception as e:
+                        log_message(f"TELEGRAM_OPEN_POSITION_FAIL {symbol} error={e}", POSITION_LOG_FILE)
 
-            except Exception as e:
-                print(f"[{utc_now()}] ORDER PROCESS ERROR {symbol}: {e}", flush=True)
-                remaining_orders.append(order)
-
-        rewrite_csv(OPEN_ORDERS_CSV, remaining_orders, OPEN_ORDER_HEADERS)
-        rewrite_csv(OPEN_POSITIONS_CSV, open_positions, OPEN_POSITION_HEADERS)
-
-
-# ---------------------------------------------------------
-# Position processing
-# ---------------------------------------------------------
-
-def process_open_positions():
-    with file_lock("engine_positions.lock"):
-        open_positions = read_csv(OPEN_POSITIONS_CSV)
-        if not open_positions:
-            return
-
-        remaining_positions = []
-
-        for pos in open_positions:
-            symbol = pos["symbol"]
-
-            try:
-                live_price = float(get_live_price(symbol))
-                pnl_pct = round(position_pnl_percent(pos, live_price), 4)
-
-                pos["live_price"] = live_price
-                pos["pnl_pct"] = pnl_pct
-
-                close_reason = should_close_position(pos, live_price)
-
-                print(
-                    f"[{utc_now()}] CHECK POSITION {symbol} {pos['side']} "
-                    f"entry={pos['entry']} sl={pos['sl']} tp={pos['tp']} "
-                    f"live={live_price} pnl={pnl_pct}% close_reason={close_reason}",
-                    flush=True,
-                )
-
-                if close_reason is None:
-                    remaining_positions.append(pos)
+                    changed = True
                     continue
 
-                score_after_close = add_score(1 if close_reason == "TP" else -1)
-                closed_pos = close_position_row(pos, close_reason, live_price, score_after_close)
-                append_csv(CLOSED_POSITIONS_CSV, closed_pos, CLOSED_POSITION_HEADERS)
+                changed = True
+                continue
 
-                log_event(
-                    "POSITION_CLOSED",
-                    symbol,
-                    pos["side"],
-                    (
-                        f"reason={close_reason} entry={pos['entry']} close={live_price} "
-                        f"pnl={pnl_pct} score={score_after_close}"
-                    ),
-                )
+            if exchange_order_id and has_open_exchange_entry_order(symbol, exchange_order_id):
+                remaining_orders.append(order)
+                continue
 
-                print(
-                    f"[{utc_now()}] CLOSE POSITION {symbol} {close_reason} "
-                    f"entry={pos['entry']} close={live_price} pnl={pnl_pct}%",
-                    flush=True,
-                )
+            order["status"] = "CANCELLED"
+            order["updated_at"] = now_utc()
+            changed = True
 
-            except Exception as e:
-                print(f"[{utc_now()}] POSITION PROCESS ERROR {symbol}: {e}", flush=True)
-                remaining_positions.append(pos)
-
-        rewrite_csv(OPEN_POSITIONS_CSV, remaining_positions, OPEN_POSITION_HEADERS)
-
-
-# ---------------------------------------------------------
-# Snapshot
-# ---------------------------------------------------------
-
-def print_snapshot():
-    open_orders = read_csv(OPEN_ORDERS_CSV)
-    open_positions = read_csv(OPEN_POSITIONS_CSV)
-
-    print("\n================ POSITION SNAPSHOT ================")
-    print(f"time={utc_now()} score={get_score()}")
-    print(f"open_orders={len(open_orders)} open_positions={len(open_positions)}")
-
-    if open_orders:
-        print("\nOPEN ORDERS:")
-        for o in open_orders[:10]:
-            print(
-                f"  {o['symbol']:<12} {o['side']:<5} "
-                f"zone=({get_order_entry_zone_low(o)},{get_order_entry_zone_high(o)}) "
-                f"trigger={get_order_entry_trigger(o)} "
-                f"sl={o.get('sl', '')} tp={o.get('tp', '')} "
-                f"rr={o.get('rr', '')} score={o.get('score', '')} "
-                f"tf={o.get('tf_context', '')} live={o.get('live_price', '')} "
-                f"touched={get_order_zone_touched(o)}"
+            log_message(
+                f"ARMED ORDER GONE {symbol} {side} exchange_order_id={exchange_order_id}",
+                POSITION_LOG_FILE,
             )
-
-    if open_positions:
-        print("\nOPEN POSITIONS:")
-        for p in open_positions[:10]:
-            print(
-                f"  {p['symbol']:<12} {p['side']:<5} entry={p['entry']} "
-                f"sl={p['sl']} tp={p['tp']} live={p.get('live_price', '')} "
-                f"pnl={p.get('pnl_pct', '')}%"
+            log_event(
+                "ARMED_ORDER_GONE",
+                symbol,
+                side,
+                f"exchange_order_id={exchange_order_id}",
+                int(order.get("score", 0)),
             )
+            continue
 
-    print("===================================================\n")
+        live_price = get_live_price(symbol)
+        trigger = to_float(order.get("entry_trigger", 0))
+
+        if live_price <= 0 or trigger <= 0:
+            remaining_orders.append(order)
+            continue
+
+        filled = (side == "LONG" and live_price >= trigger) or (side == "SHORT" and live_price <= trigger)
+
+        if filled:
+            pos = {
+                "position_id": order.get("order_id", ""),
+                "order_id": order.get("exchange_order_id", ""),
+                "symbol": symbol,
+                "side": side,
+                "entry": fmt_price(trigger),
+                "qty": "0",
+                "sl": order["sl"],
+                "tp": order["tp"],
+                "rr": order.get("rr", ""),
+                "score": order.get("score", "0"),
+                "tf_context": order.get("tf_context", ""),
+                "setup_type": order.get("setup_type", ""),
+                "setup_reason": order.get("setup_reason", ""),
+                "opened_at": now_utc(),
+                "updated_at": now_utc(),
+                "status": "OPEN_POSITION",
+                "live_price": fmt_price(live_price),
+                "pnl_pct": "0.0000",
+                "net_pnl_pct": "0.0000",
+                "net_pnl_usdt": "0.0000",
+                "fees_usdt": "0.0000",
+                "sl_order_id": "",
+                "tp_order_id": "",
+                "protection_armed": "1",
+            }
+            append_open_position(pos)
+
+            log_message(
+                f"PAPER ENTRY FILLED {symbol} {side} entry={pos['entry']} trigger={trigger}",
+                POSITION_LOG_FILE,
+            )
+            log_event(
+                "ENTRY_FILLED",
+                symbol,
+                side,
+                f"entry={pos['entry']} trigger={trigger}",
+                int(pos.get("score", 0)),
+            )
+            changed = True
+            continue
+
+        remaining_orders.append(order)
+
+    if changed:
+        write_open_orders(remaining_orders)
 
 
-def main():
-    initialize_csvs()
-    print(f"[{utc_now()}] Position engine started", flush=True)
+def archive_position(pos: Dict[str, Any], status: str, live_price: float, pnl_pct: float) -> None:
+    entry = float(pos.get("entry", 0) or 0)
+    qty = float(pos.get("qty", 0) or 0)
+
+    fees_usdt = calc_fees_usdt(entry, live_price, qty) if qty > 0 else 0.0
+    net_pnl_usdt = calc_real_pnl_usdt(entry, live_price, qty, pos["side"]) if qty > 0 else 0.0
+    net_pnl_pct = calc_real_pnl_pct(entry, live_price, pos["side"])
+
+    pos["status"] = status
+    pos["live_price"] = fmt_price(live_price)
+    pos["pnl_pct"] = f"{pnl_pct:.4f}"
+    pos["net_pnl_pct"] = f"{net_pnl_pct:.4f}"
+    pos["net_pnl_usdt"] = f"{net_pnl_usdt:.4f}"
+    pos["fees_usdt"] = f"{fees_usdt:.4f}"
+    pos["updated_at"] = now_utc()
+
+    append_closed_position(pos)
+
+    log_message(
+        f"{status} {pos['symbol']} {pos['side']} entry={pos['entry']} "
+        f"sl={pos['sl']} tp={pos['tp']} live={fmt_price(live_price)} "
+        f"gross={pnl_pct:.4f}% net={net_pnl_pct:.4f}% fees={fees_usdt:.4f}USDT",
+        POSITION_LOG_FILE,
+    )
+    log_event(
+        status,
+        pos["symbol"],
+        pos["side"],
+        f"entry={pos['entry']} sl={pos['sl']} tp={pos['tp']} "
+        f"live={fmt_price(live_price)} gross={pnl_pct:.4f}% net={net_pnl_pct:.4f}%",
+        int(pos.get("score", 0)),
+    )
+
+    if status == "TP_HIT":
+        try:
+            send_telegram_message(build_tp_message(pos))
+        except Exception as e:
+            log_message(f"TELEGRAM_TP_FAIL {pos['symbol']} error={e}", POSITION_LOG_FILE)
+    elif status == "SL_HIT":
+        try:
+            send_telegram_message(build_sl_message(pos))
+        except Exception as e:
+            log_message(f"TELEGRAM_SL_FAIL {pos['symbol']} error={e}", POSITION_LOG_FILE)
+
+
+def update_positions() -> None:
+    positions = get_open_positions()
+    alive: List[Dict[str, Any]] = []
+
+    for pos in positions:
+        symbol = pos["symbol"]
+        side = str(pos["side"]).upper()
+
+        try:
+            entry = float(pos.get("entry", 0) or 0)
+            sl = float(pos.get("sl", 0) or 0)
+            tp = float(pos.get("tp", 0) or 0)
+        except Exception:
+            alive.append(pos)
+            continue
+
+        if entry <= 0:
+            alive.append(pos)
+            continue
+
+        live_price = get_live_price(symbol)
+        if live_price <= 0:
+            alive.append(pos)
+            continue
+
+        pos["live_price"] = fmt_price(live_price)
+        pos["updated_at"] = now_utc()
+
+        if side == "LONG":
+            pnl_pct = ((live_price - entry) / entry) * 100
+            tp_hit_by_price = live_price >= tp if tp > 0 else False
+            sl_hit_by_price = live_price <= sl if sl > 0 else False
+        else:
+            pnl_pct = ((entry - live_price) / entry) * 100
+            tp_hit_by_price = live_price <= tp if tp > 0 else False
+            sl_hit_by_price = live_price >= sl if sl > 0 else False
+
+        pos["pnl_pct"] = f"{pnl_pct:.4f}"
+
+        if is_real_mode():
+            real_pos = get_real_position(symbol)
+
+            if real_pos is None:
+                if tp_hit_by_price:
+                    archive_position(pos, "TP_HIT", live_price, pnl_pct)
+                elif sl_hit_by_price:
+                    archive_position(pos, "SL_HIT", live_price, pnl_pct)
+                else:
+                    archive_position(pos, "CLOSED_ON_BINANCE", live_price, pnl_pct)
+                continue
+
+            alive.append(pos)
+            continue
+
+        if tp_hit_by_price:
+            archive_position(pos, "TP_HIT", live_price, pnl_pct)
+            continue
+
+        if sl_hit_by_price:
+            archive_position(pos, "SL_HIT", live_price, pnl_pct)
+            continue
+
+        alive.append(pos)
+
+    save_open_positions(alive)
+
+
+def run_position_loop() -> None:
+    log_message(
+        f"===== POSITION LOOP START mode={CONFIG.ENGINE.EXECUTION_MODE} =====",
+        POSITION_LOG_FILE,
+    )
 
     while True:
         try:
-            process_open_orders()
-            process_open_positions()
-            print_snapshot()
-            time.sleep(PRICE_POLL_SECONDS)
-
-        except KeyboardInterrupt:
-            print("Stopped by user.", flush=True)
-            break
-
+            reconcile_armed_orders()
         except Exception as e:
-            print(f"[{utc_now()}] LOOP ERROR: {e}", flush=True)
-            time.sleep(POSITION_CHECK_INTERVAL)
+            log_message(f"RECONCILE_ARMED_ERROR error={e}", POSITION_LOG_FILE)
+
+        try:
+            update_positions()
+        except Exception as e:
+            log_message(f"POSITION_LOOP_ERROR error={e}", POSITION_LOG_FILE)
+
+        time.sleep(2)
 
 
 if __name__ == "__main__":
-    main()
+    reconcile_armed_orders()
+    update_positions()
