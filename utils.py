@@ -1,808 +1,656 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+from env import load_env
+load_env()
+
 import csv
 import os
-import tempfile
 import time
 import uuid
-from contextlib import contextmanager
-from datetime import datetime, UTC
-from typing import Dict, List, Optional, Tuple, Union
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-import fcntl
-import pandas as pd
 import requests
 
-from structure import evaluate_symbol
-import config
+from config import CONFIG
+from binance_real import BinanceFuturesClient
+
+
+_client = BinanceFuturesClient(
+    api_key=os.getenv("BINANCE_API_KEY", "").strip(),
+    api_secret=os.getenv("BINANCE_API_SECRET", "").strip(),
+    testnet=os.getenv("BINANCE_TESTNET", "true").strip().lower() == "true",
+)
 
 
 # =========================================================
-# Config
+# MODE
 # =========================================================
-
-TOP_N = getattr(config, "TOP_N", 50)
-USE_MARK_PRICE = getattr(config, "USE_MARK_PRICE", False)
-KLINE_LIMIT = getattr(config, "KLINE_LIMIT", 220)
-
-OPEN_ORDERS_CSV = getattr(config, "OPEN_ORDERS_CSV", "open_orders.csv")
-CLOSED_ORDERS_CSV = getattr(config, "CLOSED_ORDERS_CSV", "closed_orders.csv")
-HISTORY_ORDERS_CSV = getattr(config, "HISTORY_ORDERS_CSV", "history_orders.csv")
-
-OPEN_POSITIONS_CSV = getattr(config, "OPEN_POSITIONS_CSV", "open_positions.csv")
-CLOSED_POSITIONS_CSV = getattr(config, "CLOSED_POSITIONS_CSV", "closed_positions.csv")
-HISTORY_POSITIONS_CSV = getattr(config, "HISTORY_POSITIONS_CSV", "history_positions.csv")
-
-EVENT_LOG_CSV = getattr(config, "EVENT_LOG_CSV", "event_log.csv")
-SCORE_FILE = getattr(config, "SCORE_FILE", "score.txt")
-
-ENTRY_INTERVAL = getattr(config, "ENTRY_INTERVAL", "1h")
-ENTRY_CONFIRM_INTERVAL = getattr(config, "ENTRY_CONFIRM_INTERVAL", "15m")
-
-MIN_SIGNAL_SCORE = getattr(config, "MIN_SIGNAL_SCORE", 2)
-RECALCULATE_OPEN_ORDERS = getattr(config, "RECALCULATE_OPEN_ORDERS", True)
-ORDER_EXPIRY_HOURS = getattr(config, "ORDER_EXPIRY_HOURS", 8)
-BLOCK_EXISTING_SYMBOL_STATE = getattr(config, "BLOCK_EXISTING_SYMBOL_STATE", True)
-CANCEL_IF_TP_PASSED_BEFORE_FILL = getattr(config, "CANCEL_IF_TP_PASSED_BEFORE_FILL", True)
-
-MAX_ENTRY_DRIFT_PCT = getattr(config, "MAX_ENTRY_DRIFT_PCT", 3.0)
-MAX_SL_DISTANCE_PCT = getattr(config, "MAX_SL_DISTANCE_PCT", 10.0)
-MIN_TP_DISTANCE_PCT = getattr(config, "MIN_TP_DISTANCE_PCT", 0.20)
-
-SL_ATR_BUFFER_MULT = getattr(config, "SL_ATR_BUFFER_MULT", 0.2)
-TP_RR_MULT = getattr(config, "TP_RR_MULT", 1.8)
-
-ADAPTIVE_MODE_ENABLED = getattr(config, "ADAPTIVE_MODE_ENABLED", False)
-ADAPTIVE_MODE = getattr(config, "ADAPTIVE_MODE", None)
-MODE_NORMAL = getattr(config, "MODE_NORMAL", {})
-MODE_DEFENSIVE = getattr(config, "MODE_DEFENSIVE", {})
+def is_real_mode() -> bool:
+    return str(CONFIG.ENGINE.EXECUTION_MODE).upper() == "REAL"
 
 
 # =========================================================
-# Headers
+# FILE PATHS
 # =========================================================
+def open_orders_file() -> str:
+    return CONFIG.TRADE.REAL_OPEN_ORDERS_FILE if is_real_mode() else CONFIG.TRADE.PAPER_OPEN_ORDERS_FILE
 
-OPEN_ORDER_HEADERS = [
-    "order_id",
-    "symbol",
-    "side",
-    "entry_zone_low",
-    "entry_zone_high",
-    "entry_trigger",
-    "sl",
-    "tp",
-    "rr",
-    "score",
-    "tf_context",
-    "setup_type",
-    "setup_reason",
-    "created_at",
-    "status",
-    "live_price",
-    "zone_touched",
-]
 
-CLOSED_ORDER_HEADERS = [
-    "order_id",
-    "symbol",
-    "side",
-    "entry_zone_low",
-    "entry_zone_high",
-    "entry_trigger",
-    "sl",
-    "tp",
-    "rr",
-    "score",
-    "tf_context",
-    "setup_type",
-    "setup_reason",
-    "created_at",
-    "closed_at",
-    "status",
-    "close_reason",
-    "close_price",
-]
+def closed_orders_file() -> str:
+    return CONFIG.TRADE.REAL_CLOSED_ORDERS_FILE if is_real_mode() else CONFIG.TRADE.PAPER_CLOSED_ORDERS_FILE
 
-HISTORY_ORDER_HEADERS = [
-    "order_id",
-    "symbol",
-    "side",
-    "entry_zone_low",
-    "entry_zone_high",
-    "entry_trigger",
-    "sl",
-    "tp",
-    "rr",
-    "score",
-    "tf_context",
-    "setup_type",
-    "setup_reason",
-    "created_at",
-    "status",
-]
 
-OPEN_POSITION_HEADERS = [
-    "position_id",
-    "order_id",
-    "symbol",
-    "side",
-    "entry",
-    "sl",
-    "tp",
-    "opened_at",
-    "trigger_price",
-    "status",
-    "live_price",
-    "pnl_pct",
-    "partial_taken",
-]
+def open_positions_file() -> str:
+    return CONFIG.TRADE.REAL_OPEN_POSITIONS_FILE if is_real_mode() else CONFIG.TRADE.PAPER_OPEN_POSITIONS_FILE
 
-CLOSED_POSITION_HEADERS = [
-    "position_id",
-    "order_id",
-    "symbol",
-    "side",
-    "entry",
-    "sl",
-    "tp",
-    "opened_at",
-    "closed_at",
-    "close_reason",
-    "close_price",
-    "pnl_pct",
-    "score_after_close",
-    "status",
-    "partial_taken",
-]
 
-HISTORY_POSITION_HEADERS = [
-    "position_id",
-    "order_id",
-    "symbol",
-    "side",
-    "entry",
-    "sl",
-    "tp",
-    "opened_at",
-    "trigger_price",
-    "status",
-    "partial_taken"
-]
+def closed_positions_file() -> str:
+    return CONFIG.TRADE.REAL_CLOSED_POSITIONS_FILE if is_real_mode() else CONFIG.TRADE.PAPER_CLOSED_POSITIONS_FILE
 
-EVENT_HEADERS = ["time", "event", "symbol", "side", "details", "score"]
+
+def event_log_file() -> str:
+    path = getattr(CONFIG.TRADE, "EVENT_LOG_FILE", "").strip()
+    return path or "data/event_log.csv"
 
 
 # =========================================================
-# Core helpers
+# CORE HELPERS
 # =========================================================
-
-@contextmanager
-def file_lock(lock_name: str = "engine.lock"):
-    with open(lock_name, "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+def ensure_parent_dir(path: str) -> None:
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
-def utc_now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+def utc_ts() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def parse_utc(dt_str: str) -> Optional[datetime]:
-    try:
-        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=UTC)
-    except Exception:
+def now_utc() -> str:
+    return utc_ts()
+
+
+def parse_utc_ts(ts: str) -> Optional[datetime]:
+    if not ts:
         return None
 
+    for fmt in ("%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(ts, fmt)
+        except Exception:
+            continue
+    return None
 
-def safe_float(value, default: float = 0.0) -> float:
+
+def to_float(x: Any, default: float = 0.0) -> float:
     try:
-        if value in (None, "", "None"):
-            return default
-        return float(value)
+        return float(x)
     except Exception:
         return default
 
 
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+
+def fmt_price(x: Any) -> str:
+    try:
+        v = float(x)
+    except Exception:
+        v = 0.0
+
+    if abs(v) >= 1000:
+        return f"{v:.2f}"
+    if abs(v) >= 1:
+        return f"{v:.4f}"
+    return f"{v:.8f}".rstrip("0").rstrip(".")
+
+
+def pct_diff(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return abs(a - b) / abs(b)
+
+
+def new_local_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+def _safe_append_text(path: str, line: str) -> None:
+    if not path:
+        print(line, flush=True)
+        return
+
+    ensure_parent_dir(path)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+        f.flush()
+
+
+def log_message(msg: str, file: str) -> None:
+    line = f"[{utc_ts()}] {msg}"
+    print(line, flush=True)
+
+    try:
+        _safe_append_text(file, line)
+    except Exception as e:
+        print(f"[{utc_ts()}] LOG_WRITE_FAIL file={file} error={e} original={msg}", flush=True)
+
+
+def append_csv_row(path: str, row: Dict[str, Any]) -> None:
+    if not path:
+        return
+
+    ensure_parent_dir(path)
+
+    file_exists = os.path.exists(path)
+    file_empty = (not file_exists) or os.path.getsize(path) == 0
+    fieldnames = list(row.keys())
+
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if file_empty:
+            writer.writeheader()
+        writer.writerow(row)
+        f.flush()
+
+
+def log_event(event: str, symbol: str, side: str, details: str, score: int) -> None:
+    row = {
+        "time": utc_ts(),
+        "event": str(event),
+        "symbol": str(symbol),
+        "side": str(side),
+        "details": str(details),
+        "score": int(score),
+    }
+
+    path = event_log_file()
+
+    try:
+        append_csv_row(path, row)
+    except Exception as e:
+        fallback = getattr(CONFIG.TRADE, "ORDER_LOG_FILE", "logs/order.log")
+        log_message(
+            f"EVENT_LOG_WRITE_FAIL file={path} event={event} symbol={symbol} error={e}",
+            fallback,
+        )
+
+
+# =========================================================
+# HTTP
+# =========================================================
 def safe_get(
     url: str,
-    params: dict,
-    timeout: Union[int, Tuple[int, int]] = (20, 60),
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 10,
     retries: int = 5,
-    backoff: float = 2,
+    sleep_sec: int = 2,
 ):
-    last_exception = None
+    last_err = None
 
-    for attempt in range(retries):
+    for i in range(retries):
         try:
-            response = requests.get(url, params=params, timeout=timeout)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            last_exception = e
-            print(f"[SAFE_GET] attempt {attempt + 1}/{retries} failed: {e}", flush=True)
-            if attempt < retries - 1:
-                time.sleep(backoff ** attempt)
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_err = e
+            print(f"[SAFE_GET] attempt {i + 1}/{retries} failed: {e}", flush=True)
+            if i < retries - 1:
+                time.sleep(sleep_sec)
 
-    print(f"[SAFE_GET] FINAL FAIL {url} -> {last_exception}", flush=True)
+    raise last_err
+
+
+# =========================================================
+# CSV HELPERS
+# =========================================================
+def read_csv_rows(path: str) -> List[Dict[str, Any]]:
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return []
+
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except Exception:
+        return []
+
+
+def write_csv_rows(path: str, rows: List[Dict[str, Any]]) -> None:
+    if not path:
+        return
+
+    ensure_parent_dir(path)
+    tmp_path = f"{path}.tmp"
+
+    if not rows:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write("")
+            f.flush()
+        os.replace(tmp_path, path)
+        return
+
+    fieldnames = list(rows[0].keys())
+
+    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        f.flush()
+
+    os.replace(tmp_path, path)
+
+
+# =========================================================
+# DATA ACCESS
+# =========================================================
+def load_open_orders() -> List[Dict[str, Any]]:
+    return read_csv_rows(open_orders_file())
+
+
+def get_open_orders() -> List[Dict[str, Any]]:
+    return load_open_orders()
+
+
+def write_open_orders(rows: List[Dict[str, Any]]) -> None:
+    write_csv_rows(open_orders_file(), rows)
+
+
+def save_open_orders(rows: List[Dict[str, Any]]) -> None:
+    write_open_orders(rows)
+
+
+def append_open_order(row: Dict[str, Any]) -> None:
+    rows = load_open_orders()
+    rows.append(row)
+    write_open_orders(rows)
+
+
+def append_closed_order(row: Dict[str, Any]) -> None:
+    append_csv_row(closed_orders_file(), row)
+
+
+def get_open_positions() -> List[Dict[str, Any]]:
+    return read_csv_rows(open_positions_file())
+
+
+def load_open_positions() -> List[Dict[str, Any]]:
+    return get_open_positions()
+
+
+def write_open_positions(rows: List[Dict[str, Any]]) -> None:
+    write_csv_rows(open_positions_file(), rows)
+
+
+def save_open_positions(rows: List[Dict[str, Any]]) -> None:
+    write_open_positions(rows)
+
+
+def append_open_position(row: Dict[str, Any]) -> None:
+    rows = get_open_positions()
+    rows.append(row)
+    write_open_positions(rows)
+
+
+def append_open_positions(row: Dict[str, Any]) -> None:
+    append_open_position(row)
+
+
+def append_closed_position(row: Dict[str, Any]) -> None:
+    append_csv_row(closed_positions_file(), row)
+
+
+def remove_open_position(symbol: str) -> None:
+    rows = get_open_positions()
+    rows = [r for r in rows if r.get("symbol") != symbol]
+    write_open_positions(rows)
+
+
+# =========================================================
+# STATE HELPERS
+# =========================================================
+def has_existing_position(symbol: str) -> bool:
+    for row in get_open_positions():
+        if row.get("symbol") == symbol and row.get("status") == "OPEN_POSITION":
+            return True
+    return False
+
+
+def has_open_order_for_symbol(symbol: str) -> bool:
+    for row in load_open_orders():
+        if row.get("symbol") == symbol and row.get("status") in ("OPEN_ORDER", "ARMED_ORDER"):
+            return True
+    return False
+
+
+def has_existing_symbol_state(symbol: str) -> bool:
+    return has_existing_position(symbol) or has_open_order_for_symbol(symbol)
+
+
+def order_expired(order: Dict[str, Any]) -> bool:
+    exp = parse_utc_ts(order.get("expires_at", ""))
+    if not exp:
+        return False
+    return datetime.utcnow() > exp
+
+
+# =========================================================
+# ORDER / POSITION HELPERS
+# =========================================================
+def price_in_zone(side: str, live_price: float, zone_low: float, zone_high: float) -> bool:
+    low = min(zone_low, zone_high)
+    high = max(zone_low, zone_high)
+    return low <= live_price <= high
+
+
+def should_trigger_entry(order: Dict[str, Any], live_price: float) -> bool:
+    side = str(order.get("side", "")).upper()
+    trigger = to_float(order.get("entry_trigger"))
+    touched = str(order.get("zone_touched", "0")) == "1"
+
+    if not touched or trigger <= 0:
+        return False
+
+    if side == "LONG":
+        return live_price >= trigger
+    if side == "SHORT":
+        return live_price <= trigger
+    return False
+
+
+def update_zone_touch(order: Dict[str, Any], live_price: float) -> bool:
+    zone_low = to_float(order.get("entry_zone_low"))
+    zone_high = to_float(order.get("entry_zone_high"))
+    touched_now = price_in_zone(order.get("side", ""), live_price, zone_low, zone_high)
+    if touched_now:
+        order["zone_touched"] = "1"
+    return touched_now
+
+
+def update_zone_touched(order: Dict[str, Any], live_price: float) -> str:
+    zone_low = to_float(order.get("entry_zone_low"))
+    zone_high = to_float(order.get("entry_zone_high"))
+    if price_in_zone(order.get("side", ""), live_price, zone_low, zone_high):
+        return "1"
+    return order.get("zone_touched", "0")
+
+
+def set_alarm_mark(order: Dict[str, Any], key: str) -> None:
+    order[key] = "1"
+    order["last_alarm_at"] = utc_ts()
+
+
+def can_send_alarm(order: Dict[str, Any]) -> bool:
+    return True
+
+
+def trigger_alarm(msg: str) -> None:
+    print(f"ALARM: {msg}", flush=True)
+
+
+def make_order_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    now = utc_ts()
+    return {
+        "order_id": new_local_id(),
+        "symbol": candidate["symbol"],
+        "side": candidate["side"],
+        "entry_zone_low": fmt_price(candidate["entry_zone_low"]),
+        "entry_zone_high": fmt_price(candidate["entry_zone_high"]),
+        "entry_trigger": fmt_price(candidate["entry_trigger"]),
+        "sl": fmt_price(candidate["sl"]),
+        "tp": fmt_price(candidate["tp"]),
+        "rr": f"{float(candidate['rr']):.2f}",
+        "score": str(candidate["score"]),
+        "tf_context": candidate.get("tf_context", ""),
+        "setup_type": candidate.get("setup_type", ""),
+        "setup_reason": candidate.get("setup_reason", ""),
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": candidate.get("expires_at", ""),
+        "status": "OPEN_ORDER",
+        "live_price": fmt_price(candidate.get("live_price", 0)),
+        "zone_touched": "0",
+        "alarm_touched_sent": "0",
+        "alarm_near_trigger_sent": "0",
+        "last_alarm_at": "",
+        "exchange_order_placed": "0",
+        "exchange_order_id": "",
+    }
+
+
+def make_position_row_from_order(order: Dict[str, Any], entry: float) -> Dict[str, Any]:
+    now = utc_ts()
+    return {
+        "position_id": order.get("order_id", new_local_id()),
+        "order_id": order.get("exchange_order_id", ""),
+        "symbol": order["symbol"],
+        "side": order["side"],
+        "entry": fmt_price(entry),
+        "sl": order["sl"],
+        "tp": order["tp"],
+        "rr": order.get("rr", ""),
+        "score": order.get("score", "0"),
+        "tf_context": order.get("tf_context", ""),
+        "setup_type": order.get("setup_type", ""),
+        "setup_reason": order.get("setup_reason", ""),
+        "opened_at": now,
+        "updated_at": now,
+        "status": "OPEN_POSITION",
+        "live_price": fmt_price(entry),
+        "pnl_pct": "0.0000",
+    }
+
+
+# =========================================================
+# EXCHANGE PRECISION
+# =========================================================
+_exchange_info_cache: Optional[Dict[str, Any]] = None
+
+
+def get_exchange_info() -> Dict[str, Any]:
+    global _exchange_info_cache
+    if _exchange_info_cache is None:
+        _exchange_info_cache = _client.exchange_info()
+    return _exchange_info_cache
+
+
+def get_symbol_info(symbol: str) -> Optional[Dict[str, Any]]:
+    info = get_exchange_info()
+    for s in info.get("symbols", []):
+        if s.get("symbol") == symbol:
+            return s
     return None
 
 
-# =========================================================
-# CSV helpers
-# =========================================================
-
-def ensure_csv(path: str, headers: List[str]) -> None:
-    if not os.path.exists(path):
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
-            writer.writeheader()
-
-
-def append_csv(path: str, row: dict, headers: List[str]) -> None:
-    ensure_csv(path, headers)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writerow({h: row.get(h, "") for h in headers})
-
-
-def rewrite_csv(path: str, rows: List[dict], headers: List[str]) -> None:
-    dir_name = os.path.dirname(path) or "."
-    fd, temp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp", text=True)
-    os.close(fd)
-
-    try:
-        with open(temp_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({h: row.get(h, "") for h in headers})
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-
-
-def read_csv(path: str) -> List[dict]:
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
-
-
-def initialize_csvs() -> None:
-    ensure_csv(OPEN_ORDERS_CSV, OPEN_ORDER_HEADERS)
-    ensure_csv(CLOSED_ORDERS_CSV, CLOSED_ORDER_HEADERS)
-    ensure_csv(HISTORY_ORDERS_CSV, HISTORY_ORDER_HEADERS)
-
-    ensure_csv(OPEN_POSITIONS_CSV, OPEN_POSITION_HEADERS)
-    ensure_csv(CLOSED_POSITIONS_CSV, CLOSED_POSITION_HEADERS)
-    ensure_csv(HISTORY_POSITIONS_CSV, HISTORY_POSITION_HEADERS)
-
-    ensure_csv(EVENT_LOG_CSV, EVENT_HEADERS)
-
-    if not os.path.exists(SCORE_FILE):
-        with open(SCORE_FILE, "w", encoding="utf-8") as f:
-            f.write("0")
-
-
-# =========================================================
-# Score / event helpers
-# =========================================================
-
-def get_score() -> int:
-    if not os.path.exists(SCORE_FILE):
-        return 0
-    try:
-        with open(SCORE_FILE, "r", encoding="utf-8") as f:
-            return int((f.read() or "0").strip())
-    except Exception:
-        return 0
-
-
-def set_score(score: int) -> None:
-    with open(SCORE_FILE, "w", encoding="utf-8") as f:
-        f.write(str(score))
-
-
-def add_score(delta: int) -> int:
-    score = get_score() + delta
-    set_score(score)
-    return score
-
-
-def log_event(event: str, symbol: str = "", side: str = "", details: str = "") -> None:
-    append_csv(
-        EVENT_LOG_CSV,
-        {
-            "time": utc_now(),
-            "event": event,
-            "symbol": symbol,
-            "side": side,
-            "details": details,
-            "score": get_score(),
-        },
-        EVENT_HEADERS,
-    )
-
-
-# =========================================================
-# Exchange / market data helpers
-# =========================================================
-
-def tick_to_decimals(tick: float) -> int:
-    text = f"{tick:.16f}".rstrip("0")
+def _step_decimals(step: float) -> int:
+    text = f"{step:.16f}".rstrip("0")
     if "." not in text:
         return 0
     return len(text.split(".")[1])
 
 
-def round_price(price: float, decimals: int) -> float:
-    return round(price, decimals)
+def round_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return float(int(value / step) * step)
 
 
-def get_exchange_info():
-    data = safe_get("https://fapi.binance.com/fapi/v1/exchangeInfo", {})
-    if not data:
-        return {"symbols": []}
-    return data
+def round_price(symbol: str, value: float) -> float:
+    info = get_symbol_info(symbol)
+    if not info:
+        return value
+
+    for f in info.get("filters", []):
+        if f.get("filterType") == "PRICE_FILTER":
+            tick_size = to_float(f.get("tickSize"), 0.0)
+            rounded = round_step(value, tick_size)
+            decimals = _step_decimals(tick_size)
+            return float(f"{rounded:.{decimals}f}")
+    return value
 
 
-def get_top_volume_symbols(top_n: int = TOP_N) -> List[str]:
-    tickers = safe_get("https://fapi.binance.com/fapi/v1/ticker/24hr", {})
-    if not tickers:
-        print("[ERROR] ticker fetch failed, skipping cycle", flush=True)
+def round_qty(symbol: str, value: float) -> float:
+    info = get_symbol_info(symbol)
+    if not info:
+        return value
+
+    for f in info.get("filters", []):
+        if f.get("filterType") == "LOT_SIZE":
+            step_size = to_float(f.get("stepSize"), 0.0)
+            min_qty = to_float(f.get("minQty"), 0.0)
+            rounded = round_step(value, step_size)
+            if rounded < min_qty:
+                rounded = min_qty
+            decimals = _step_decimals(step_size)
+            return float(f"{rounded:.{decimals}f}")
+    return value
+
+
+# =========================================================
+# MARKET DATA
+# =========================================================
+def get_price(symbol: str) -> float:
+    try:
+        data = _client.ticker_price(symbol=symbol)
+        return float(data.get("price", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def safe_get_live_price(symbol: str) -> Optional[float]:
+    price = get_price(symbol)
+    if price <= 0:
+        return None
+    return price
+
+
+def get_top_symbols(limit: int = 100) -> List[str]:
+    try:
+        info = _client.exchange_info()
+        valid_symbols = set()
+
+        for s in info.get("symbols", []):
+            symbol = s.get("symbol", "")
+            status = s.get("status", "")
+            contract_type = s.get("contractType", "")
+            quote_asset = s.get("quoteAsset", "")
+
+            if (
+                symbol.endswith("USDT")
+                and quote_asset == "USDT"
+                and contract_type == "PERPETUAL"
+                and status == "TRADING"
+            ):
+                valid_symbols.add(symbol)
+
+        tickers = safe_get(
+            f"{_client.base_url}/fapi/v1/ticker/24hr",
+            timeout=10,
+            retries=3,
+            sleep_sec=1,
+        ).json()
+
+        ranked = []
+        for t in tickers:
+            symbol = t.get("symbol", "")
+            if symbol not in valid_symbols:
+                continue
+
+            quote_volume = to_float(t.get("quoteVolume", 0))
+            ranked.append((symbol, quote_volume))
+
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return [symbol for symbol, _ in ranked[:limit]]
+
+    except Exception as e:
+        log_message(f"TOP_SYMBOLS_FETCH_FAIL error={e}", CONFIG.TRADE.ORDER_LOG_FILE)
+        base = [
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+            "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+        ]
+        return base[:limit]
+
+
+def get_all_symbols(limit: int = 100) -> List[str]:
+    return get_top_symbols(limit=limit)
+
+
+def get_klines(symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
+    try:
+        raw = _client.klines(symbol=symbol, interval=interval, limit=limit)
+        out = []
+        for k in raw:
+            out.append(
+                {
+                    "open_time": k[0],
+                    "open": to_float(k[1]),
+                    "high": to_float(k[2]),
+                    "low": to_float(k[3]),
+                    "close": to_float(k[4]),
+                    "volume": to_float(k[5]),
+                    "close_time": k[6],
+                }
+            )
+        return out
+    except Exception:
         return []
 
-    exchange_info = get_exchange_info()
-    valid_symbols = set()
 
-    for s in exchange_info["symbols"]:
-        if (
-            s.get("contractType") == "PERPETUAL"
-            and s.get("status") == "TRADING"
-            and s.get("quoteAsset") == "USDT"
-        ):
-            valid_symbols.add(s["symbol"])
-
-    filtered = []
-    for t in tickers:
-        sym = t.get("symbol")
-        if sym in valid_symbols:
-            filtered.append((sym, safe_float(t.get("quoteVolume"), 0.0)))
-
-    filtered.sort(key=lambda x: x[1], reverse=True)
-    return [sym for sym, _ in filtered[:top_n]]
-
-
-def build_price_precision_map(symbols: List[str]) -> Dict[str, int]:
-    info = get_exchange_info()
-    wanted = set(symbols)
-    out = {}
-
-    for s in info["symbols"]:
-        sym = s["symbol"]
-        if sym not in wanted:
-            continue
-
-        tick_size = None
-        for f in s.get("filters", []):
-            if f.get("filterType") == "PRICE_FILTER":
-                tick_size = safe_float(f.get("tickSize"))
-                break
-
-        out[sym] = tick_to_decimals(tick_size) if tick_size else 4
-
+# =========================================================
+# TECHNICALS
+# =========================================================
+def ema(values: List[float], period: int) -> List[float]:
+    if not values:
+        return []
+    k = 2 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
     return out
 
 
-def get_live_price(symbol: str) -> float:
-    if USE_MARK_PRICE:
-        data = safe_get("https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": symbol})
-        if not data:
-            return 0.0
-        return safe_float(data.get("markPrice"))
-
-    data = safe_get("https://fapi.binance.com/fapi/v1/ticker/price", {"symbol": symbol})
-    if not data:
-        return 0.0
-    return safe_float(data.get("price"))
-
-
-def get_klines(symbol: str, interval: str, limit: int = KLINE_LIMIT) -> List[dict]:
-    data = safe_get(
-        "https://fapi.binance.com/fapi/v1/klines",
-        {"symbol": symbol, "interval": interval, "limit": limit},
-    )
-    if not data:
-        return []
-
-    candles = []
-    for k in data:
-        candles.append(
-            {
-                "open_time": int(k[0]),
-                "open": safe_float(k[1]),
-                "high": safe_float(k[2]),
-                "low": safe_float(k[3]),
-                "close": safe_float(k[4]),
-                "volume": safe_float(k[5]),
-                "close_time": int(k[6]),
-            }
-        )
-    return candles
-
-
-def klines_to_df(klines: List[dict]) -> pd.DataFrame:
-    rows = []
-    for k in klines:
-        rows.append(
-            {
-                "open": safe_float(k["open"]),
-                "high": safe_float(k["high"]),
-                "low": safe_float(k["low"]),
-                "close": safe_float(k["close"]),
-                "volume": safe_float(k.get("volume", 0.0)),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-# =========================================================
-# Adaptive mode helpers
-# =========================================================
-
-def calculate_mode() -> str:
-    if not ADAPTIVE_MODE_ENABLED:
-        return "NORMAL"
-
-    score = get_score()
-    hot = getattr(ADAPTIVE_MODE, "HOT_SCORE_THRESHOLD", 2) if ADAPTIVE_MODE else 2
-    cold = getattr(ADAPTIVE_MODE, "COLD_SCORE_THRESHOLD", -2) if ADAPTIVE_MODE else -2
-
-    if score <= cold:
-        return "DEFENSIVE"
-    if score >= hot:
-        return "NORMAL"
-    return "NORMAL"
-
-
-def get_mode_settings() -> Tuple[str, dict]:
-    mode = calculate_mode()
-    if mode == "DEFENSIVE":
-        return mode, MODE_DEFENSIVE
-    return mode, MODE_NORMAL
-
-
-# =========================================================
-# Backward compatibility helpers
-# =========================================================
-
-def get_order_entry_zone_low(order: dict) -> float:
-    if "entry_zone_low" in order and order.get("entry_zone_low") not in ("", None):
-        return safe_float(order.get("entry_zone_low"))
-    return safe_float(order.get("entry"))
-
-
-def get_order_entry_zone_high(order: dict) -> float:
-    if "entry_zone_high" in order and order.get("entry_zone_high") not in ("", None):
-        return safe_float(order.get("entry_zone_high"))
-    return safe_float(order.get("entry"))
-
-
-def get_order_entry_trigger(order: dict) -> float:
-    if "entry_trigger" in order and order.get("entry_trigger") not in ("", None):
-        return safe_float(order.get("entry_trigger"))
-    return safe_float(order.get("entry"))
-
-
-def get_order_zone_touched(order: dict) -> bool:
-    raw = str(order.get("zone_touched", "")).strip().lower()
-    return raw in ("1", "true", "yes", "y")
-
-
-def set_order_zone_touched(order: dict, value: bool) -> None:
-    order["zone_touched"] = "1" if value else "0"
-
-
-# =========================================================
-# Zone / trigger logic
-# =========================================================
-
-def price_inside_entry_zone(order: dict, live_price: float) -> bool:
-    low = get_order_entry_zone_low(order)
-    high = get_order_entry_zone_high(order)
-    return low <= live_price <= high
-
-
-def resolve_entry(order: dict, live_price: float) -> float:
-    raw_entry = order.get("entry")
-    if raw_entry is not None and str(raw_entry).strip() != "":
-        return safe_float(raw_entry)
-
-    zone_low = safe_float(order.get("entry_zone_low"))
-    zone_high = safe_float(order.get("entry_zone_high"))
-
-    if zone_low <= live_price <= zone_high:
-        return live_price
-
-    if zone_low > 0 and zone_high > 0:
-        return (zone_low + zone_high) / 2.0
-
-    trigger = safe_float(order.get("entry_trigger"))
-    return trigger if trigger > 0 else live_price
-
-
-def should_trigger_entry(order: dict, live_price: float) -> bool:
-    trigger = get_order_entry_trigger(order)
-    side = order["side"]
-
-    if side == "LONG":
-        return live_price >= trigger
-    return live_price <= trigger
-
-
-def should_cancel_before_fill(order: dict, live_price: float) -> Optional[str]:
-    if not CANCEL_IF_TP_PASSED_BEFORE_FILL:
-        return None
-
-    side = order["side"]
-    tp = safe_float(order.get("tp"))
-    sl = safe_float(order.get("sl"))
-
-    if side == "LONG":
-        if live_price >= tp:
-            return "TP_PASSED_BEFORE_FILL"
-        if live_price <= sl:
-            return "SL_PASSED_BEFORE_FILL"
-    else:
-        if live_price <= tp:
-            return "TP_PASSED_BEFORE_FILL"
-        if live_price >= sl:
-            return "SL_PASSED_BEFORE_FILL"
-
-    return None
-
-
-# =========================================================
-# Order builders / recalculation
-# =========================================================
-
-def build_order(symbol: str, precision: int, min_score_override=None, debug=False):
-    try:
-        klines_1h = get_klines(symbol, ENTRY_INTERVAL, KLINE_LIMIT)
-        klines_15m = get_klines(symbol, ENTRY_CONFIRM_INTERVAL, KLINE_LIMIT)
-
-        if not klines_1h or not klines_15m:
-            return None, "EMPTY_KLINES"
-
-        df_1h = klines_to_df(klines_1h)
-        df_15m = klines_to_df(klines_15m)
-
-        order, reason = evaluate_symbol(
-            symbol=symbol,
-            precision=precision,
-            df_1h_raw=df_1h,
-            df_15m_raw=df_15m,
-            min_score_override=min_score_override,
-        )
-
-        if not order:
-            return None, reason
-
-        order["order_id"] = str(uuid.uuid4())[:8]
-        order["created_at"] = utc_now()
-        order["status"] = "OPEN_ORDER"
-        order["live_price"] = round_price(get_live_price(symbol), precision)
-        order["zone_touched"] = str(order.get("zone_touched", "0") or "0")
-
-        return order, reason
-
-    except Exception as e:
-        return None, f"BUILD_ORDER_ERROR: {e}"
-
-
-def recalculate_order_levels(existing_order: dict, precision: int) -> Tuple[str, Optional[dict], str]:
-    try:
-        symbol = existing_order["symbol"]
-
-        klines_1h = get_klines(symbol, ENTRY_INTERVAL, KLINE_LIMIT)
-        klines_15m = get_klines(symbol, ENTRY_CONFIRM_INTERVAL, KLINE_LIMIT)
-
-        if not klines_1h or not klines_15m:
-            return "INVALID", None, "EMPTY_KLINES"
-
-        df_1h = klines_to_df(klines_1h)
-        df_15m = klines_to_df(klines_15m)
-
-        new_order, reason = evaluate_symbol(
-            symbol=symbol,
-            precision=precision,
-            df_1h_raw=df_1h,
-            df_15m_raw=df_15m,
-            min_score_override=None,
-        )
-
-        if not new_order:
-            return "INVALID", None, reason
-
-        new_order["order_id"] = existing_order.get("order_id")
-        new_order["created_at"] = existing_order.get("created_at")
-        new_order["status"] = existing_order.get("status", "OPEN_ORDER")
-        new_order["live_price"] = round_price(get_live_price(symbol), precision)
-        new_order["zone_touched"] = existing_order.get("zone_touched", "0")
-
-        return "UPDATED", new_order, reason
-
-    except Exception as e:
-        return "INVALID", None, f"RECALC_ERROR: {e}"
-
-
-# =========================================================
-# Order state helpers
-# =========================================================
-
-def order_expired(order: dict) -> bool:
-    created_at = parse_utc(order.get("created_at", ""))
-    if created_at is None:
-        return False
-
-    age_seconds = (datetime.now(UTC) - created_at).total_seconds()
-    return age_seconds > ORDER_EXPIRY_HOURS * 3600
-
-
-def symbol_has_existing_state(symbol: str, open_orders: List[dict], open_positions: List[dict]) -> bool:
-    for row in open_orders:
-        if row.get("symbol") == symbol:
-            return True
-    for row in open_positions:
-        if row.get("symbol") == symbol:
-            return True
-    return False
-
-
-# =========================================================
-# Order / position row helpers
-# =========================================================
-
-def history_order_row(order: dict) -> dict:
-    return {
-        "order_id": order["order_id"],
-        "symbol": order["symbol"],
-        "side": order["side"],
-        "entry_zone_low": get_order_entry_zone_low(order),
-        "entry_zone_high": get_order_entry_zone_high(order),
-        "entry_trigger": get_order_entry_trigger(order),
-        "sl": safe_float(order["sl"]),
-        "tp": safe_float(order["tp"]),
-        "rr": order.get("rr", ""),
-        "score": order.get("score", ""),
-        "tf_context": order.get("tf_context", ""),
-        "setup_type": order.get("setup_type", ""),
-        "setup_reason": order.get("setup_reason", ""),
-        "created_at": order.get("created_at", ""),
-        "status": order.get("status", "OPEN_ORDER"),
-    }
-
-
-def close_order_row(order: dict, reason: str, close_price: Optional[float] = None) -> dict:
-    return {
-        "order_id": order["order_id"],
-        "symbol": order["symbol"],
-        "side": order["side"],
-        "entry_zone_low": get_order_entry_zone_low(order),
-        "entry_zone_high": get_order_entry_zone_high(order),
-        "entry_trigger": get_order_entry_trigger(order),
-        "sl": safe_float(order["sl"]),
-        "tp": safe_float(order["tp"]),
-        "rr": order.get("rr", ""),
-        "score": order.get("score", ""),
-        "tf_context": order.get("tf_context", ""),
-        "setup_type": order.get("setup_type", ""),
-        "setup_reason": order.get("setup_reason", ""),
-        "created_at": order.get("created_at", ""),
-        "closed_at": utc_now(),
-        "status": "CLOSED_ORDER",
-        "close_reason": reason,
-        "close_price": "" if close_price is None else close_price,
-    }
-
-
-def open_position_from_order(order: dict, trigger_price: float) -> dict:
-    return {
-        "position_id": str(uuid.uuid4())[:8],
-        "order_id": order["order_id"],
-        "symbol": order["symbol"],
-        "side": order["side"],
-        "entry": resolve_entry(order, trigger_price),
-        "sl": safe_float(order["sl"]),
-        "tp": safe_float(order["tp"]),
-        "opened_at": utc_now(),
-        "trigger_price": trigger_price,
-        "status": "OPEN_POSITION",
-        "live_price": trigger_price,
-        "pnl_pct": 0.0,
-    }
-
-
-def history_position_row(position: dict) -> dict:
-    return {
-        "position_id": position["position_id"],
-        "order_id": position["order_id"],
-        "symbol": position["symbol"],
-        "side": position["side"],
-        "entry": safe_float(position["entry"]),
-        "sl": safe_float(position["sl"]),
-        "tp": safe_float(position["tp"]),
-        "opened_at": position["opened_at"],
-        "trigger_price": safe_float(position.get("trigger_price")),
-        "status": position.get("status", "OPEN_POSITION"),
-    }
-
-
-def close_position_row(
-    position: dict,
-    reason: str,
-    close_price: float,
-    score_after_close: Optional[int] = None,
-) -> dict:
-    if score_after_close is None:
-        score_after_close = get_score()
-    side = position["side"]
-
-    return {
-        "position_id": position["position_id"],
-        "order_id": position["order_id"],
-        "symbol": position["symbol"],
-        "side": side,
-        "entry": safe_float(position["entry"]),
-        "sl": safe_float(position["sl"]),
-        "tp": safe_float(position["tp"]),
-        "opened_at": position["opened_at"],
-        "closed_at": utc_now(),
-        "close_reason": reason,
-        "close_price": close_price,
-        "pnl_pct": round(position_pnl_percent(side, position, close_price), 4),
-        "score_after_close": score_after_close,
-        "status": "CLOSED_POSITION",
-    }
-
-
-# =========================================================
-# Position helpers
-# =========================================================
-
-def position_pnl_percent(side, entry_price, live_price):
-    if entry_price == 0:
+def atr(klines: List[Dict[str, Any]], period: int) -> float:
+    if len(klines) < period + 1:
         return 0.0
 
-    side = str(side).upper()
+    trs = []
+    for i in range(1, len(klines)):
+        high = to_float(klines[i]["high"])
+        low = to_float(klines[i]["low"])
+        prev_close = to_float(klines[i - 1]["close"])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
 
-    if side == "LONG":
-        return ((live_price - entry_price) / entry_price) * 100
-    elif side == "SHORT":
-        return ((entry_price - live_price) / entry_price) * 100
-    else:
+    if len(trs) < period:
         return 0.0
 
+    return sum(trs[-period:]) / period
 
-def should_close_position(position: dict, live_price: float) -> Optional[str]:
-    side = position["side"]
-    sl = safe_float(position["sl"])
-    tp = safe_float(position["tp"])
 
-    if side == "LONG":
-        if live_price <= sl:
-            return "SL"
-        if live_price >= tp:
-            return "TP"
-    else:
-        if live_price >= sl:
-            return "SL"
-        if live_price <= tp:
-            return "TP"
+def classify_trend(closes: List[float]) -> str:
+    if len(closes) < max(CONFIG.TRADE.EMA_FAST, CONFIG.TRADE.EMA_MID):
+        return "RANGE"
 
-    return None
+    fast = ema(closes, CONFIG.TRADE.EMA_FAST)[-1]
+    mid = ema(closes, CONFIG.TRADE.EMA_MID)[-1]
+    last = closes[-1]
+
+    if last > fast > mid:
+        return "LONG"
+    if last < fast < mid:
+        return "SHORT"
+    return "RANGE"
