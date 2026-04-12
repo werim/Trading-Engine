@@ -196,9 +196,21 @@ def new_position_id(symbol: str, side: str) -> str:
     return f"pos-{symbol}-{side}-{stamp}"[-32:]
 
 
-def price_in_zone(live_price: float, zone_low: float, zone_high: float) -> bool:
+def price_in_zone(live_price: float, side: str, zone_low: float, zone_high: float) -> bool:
+    try:
+        live_price = float(live_price)
+        zone_low = float(zone_low)
+        zone_high = float(zone_high)
+    except (TypeError, ValueError):
+        return False
+
     low = min(zone_low, zone_high)
     high = max(zone_low, zone_high)
+
+    side = str(side).upper()
+    if side not in {"LONG", "SHORT"}:
+        return False
+
     return low <= live_price <= high
 
 
