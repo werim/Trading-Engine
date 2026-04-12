@@ -7,141 +7,57 @@ cd "$BASE_DIR" || exit 1
 
 DATA_DIR="$BASE_DIR/data"
 LOG_DIR="$BASE_DIR/logs"
+ARCHIVE_DIR="$BASE_DIR/archive"
+TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
 
-mkdir -p "$DATA_DIR" "$LOG_DIR"
+mkdir -p "$DATA_DIR" "$LOG_DIR" "$ARCHIVE_DIR"
 
-RESET_SCORE=0
-RESET_ALL=0
+echo "========== TRADING ENGINE RESET =========="
 
-for arg in "$@"; do
-  case "$arg" in
-    --score)
-      RESET_SCORE=1
-      ;;
-    --all)
-      RESET_ALL=1
-      RESET_SCORE=1
-      ;;
-    *)
-      echo "Unknown option: $arg"
-      echo "Usage: ./reset.sh [--score] [--all]"
-      exit 1
-      ;;
-  esac
-done
-
-EXECUTION_MODE=$(python3 - <<'PY'
-from config import CONFIG
-print(CONFIG.ENGINE.EXECUTION_MODE.upper())
-PY
-)
-
-STRATEGY_MODE=$(python3 - <<'PY'
-from config import CONFIG
-print(CONFIG.ENGINE.STRATEGY_MODE.upper())
-PY
-)
-
-SCORE_FILE=$(python3 - <<'PY'
-from config import CONFIG
-print(CONFIG.ADAPTIVE.SCORE_FILE)
-PY
-)
-
-echo "Resetting unified trading engine data..."
-echo "Execution mode : $EXECUTION_MODE"
-echo "Strategy mode  : $STRATEGY_MODE"
-
-write_orders_header() {
-  local file="$1"
-  cat > "$file" <<'EOF'
-order_id,symbol,side,entry_zone_low,entry_zone_high,entry_trigger,sl,tp,rr,score,tf_context,setup_type,setup_reason,created_at,updated_at,expires_at,status,live_price,zone_touched,alarm_touched_sent,alarm_near_trigger_sent,last_alarm_at,exchange_order_placed,exchange_order_id,gross_profit_pct,net_profit_pct,net_loss_pct,net_rr,expected_net_profit_usdt,total_cost_pct
-EOF
-}
-
-write_closed_orders_header() {
-  local file="$1"
-  cat > "$file" <<'EOF'
-order_id,symbol,side,entry_zone_low,entry_zone_high,entry_trigger,sl,tp,rr,score,tf_context,setup_type,setup_reason,created_at,updated_at,expires_at,status,live_price,zone_touched,alarm_touched_sent,alarm_near_trigger_sent,last_alarm_at,exchange_order_placed,exchange_order_id,gross_profit_pct,net_profit_pct,net_loss_pct,net_rr,expected_net_profit_usdt,total_cost_pct,close_reason
-EOF
-}
-
-write_positions_header() {
-  local file="$1"
-  cat > "$file" <<'EOF'
-position_id,order_id,symbol,side,entry,qty,sl,tp,rr,score,tf_context,setup_type,setup_reason,opened_at,updated_at,status,live_price,pnl_pct,net_pnl_pct,net_pnl_usdt,fees_usdt,sl_order_id,tp_order_id,protection_armed
-EOF
-}
-
-reset_paper_files() {
-  echo "Clearing PAPER mode CSV files..."
-  write_orders_header "$DATA_DIR/open_orders.csv"
-  write_closed_orders_header "$DATA_DIR/closed_orders.csv"
-  write_positions_header "$DATA_DIR/open_positions.csv"
-  write_positions_header "$DATA_DIR/closed_positions.csv"
-}
-
-reset_real_files() {
-  echo "Clearing REAL mode CSV files..."
-  write_orders_header "$DATA_DIR/real_open_orders.csv"
-  write_closed_orders_header "$DATA_DIR/real_closed_orders.csv"
-  write_positions_header "$DATA_DIR/real_open_positions.csv"
-  write_positions_header "$DATA_DIR/real_closed_positions.csv"
-}
-
-reset_shared_files() {
-  cat > "$DATA_DIR/event_log.csv" <<'EOF'
-time,event,symbol,side,details,score
-EOF
-
-  : > "$LOG_DIR/order.log"
-  : > "$LOG_DIR/order.supervisor.log"
-  : > "$LOG_DIR/position.log"
-  : > "$LOG_DIR/position.supervisor.log"
-  : > "$LOG_DIR/position_ws.log"
-
-  rm -f \
-    .run_pid \
-    .order.pid \
-    .position.pid \
-    .position_ws.pid \
-    engine.lock \
-    engine_orders.lock \
-    engine_positions.lock \
-    engine_open_orders.lock \
-    engine_generation.lock \
-    engine_trigger.lock
-}
-
-if [ "$RESET_ALL" -eq 1 ]; then
-  reset_paper_files
-  reset_real_files
-  reset_shared_files
+if [ -f "$BASE_DIR/stop.sh" ]; then
+  bash "$BASE_DIR/stop.sh"
 else
-  if [ "$EXECUTION_MODE" = "REAL" ]; then
-    reset_real_files
-  elif [ "$EXECUTION_MODE" = "PAPER" ]; then
-    reset_paper_files
-  else
-    echo "❌ Unknown CONFIG.ENGINE.EXECUTION_MODE: $EXECUTION_MODE"
-    exit 1
-  fi
-
-  reset_shared_files
+  echo "stop.sh not found, skipping stop phase"
 fi
 
-if [ "$RESET_SCORE" -eq 1 ]; then
-  echo "Resetting adaptive score..."
-  mkdir -p "$(dirname "$SCORE_FILE")"
-  echo "0" > "$SCORE_FILE"
-else
-  if [ -f "$SCORE_FILE" ]; then
-    echo "Keeping adaptive score: $(cat "$SCORE_FILE" 2>/dev/null || echo 0)"
-  else
-    echo "Adaptive score file not found, creating with 0"
-    mkdir -p "$(dirname "$SCORE_FILE")"
-    echo "0" > "$SCORE_FILE"
-  fi
-fi
+mkdir -p "$ARCHIVE_DIR/$TIMESTAMP"
 
-echo "✅ Reset complete."
+archive_if_exists() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    mv "$file" "$ARCHIVE_DIR/$TIMESTAMP/"
+    echo "Archived: $file"
+  fi
+}
+
+archive_if_exists "$DATA_DIR/open_orders.csv"
+archive_if_exists "$DATA_DIR/open_positions.csv"
+archive_if_exists "$DATA_DIR/closed_positions.csv"
+archive_if_exists "$DATA_DIR/symbol_meta.json"
+archive_if_exists "$DATA_DIR/market_cache.json"
+
+archive_if_exists "$LOG_DIR/order.log"
+archive_if_exists "$LOG_DIR/position.log"
+archive_if_exists "$LOG_DIR/engine.log"
+
+cat > "$DATA_DIR/open_orders.csv" <<'EOF'
+order_id,symbol,side,entry_zone_low,entry_zone_high,entry_trigger,sl,tp,rr,score,tf_context,setup_type,setup_reason,created_at,updated_at,expires_at,status,live_price,zone_touched,alarm_touched_sent,alarm_near_trigger_sent,last_alarm_at,expected_net_pnl_pct,stop_net_loss_pct,volume_24h_usdt,spread_pct,funding_rate_pct
+EOF
+
+cat > "$DATA_DIR/open_positions.csv" <<'EOF'
+position_id,order_id,symbol,side,entry,qty,sl,tp,rr,score,tf_context,setup_type,setup_reason,opened_at,updated_at,status,live_price,pnl_pct,net_pnl_pct,net_pnl_usdt,fees_usdt,sl_order_id,tp_order_id,protection_armed,partial_taken,break_even_armed,highest_price,lowest_price
+EOF
+
+cat > "$DATA_DIR/closed_positions.csv" <<'EOF'
+position_id,order_id,symbol,side,entry,qty,sl,tp,rr,score,tf_context,setup_type,setup_reason,opened_at,updated_at,status,live_price,pnl_pct,net_pnl_pct,net_pnl_usdt,fees_usdt,sl_order_id,tp_order_id,protection_armed,partial_taken,break_even_armed,highest_price,lowest_price,closed_at,close_reason,close_price
+EOF
+
+touch "$LOG_DIR/order.log"
+touch "$LOG_DIR/position.log"
+touch "$LOG_DIR/engine.log"
+
+echo
+echo "Reset complete."
+echo "Archived old files into: $ARCHIVE_DIR/$TIMESTAMP"
+echo "Fresh CSV and log files created."
+echo "=========================================="
