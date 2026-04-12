@@ -1,221 +1,123 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+from dotenv import load_dotenv
+load_dotenv()
 
-from dataclasses import dataclass
-from env import load_env
-
-load_env()
+from dataclasses import dataclass, field
+import os
 
 
 @dataclass
 class EngineConfig:
-    EXECUTION_MODE: str = "REAL"      # PAPER | REAL
-    STRATEGY_MODE: str = "BALANCED"   # AGGRESSIVE | BALANCED | SAFE | AUTO
+    EXECUTION_MODE: str = os.getenv("EXECUTION_MODE", "REAL").upper()  # PAPER | REAL
+    BASE_DIR: str = os.getenv("BASE_DIR", ".")
+    DATA_DIR: str = os.getenv("DATA_DIR", "data")
+    LOG_DIR: str = os.getenv("LOG_DIR", "logs")
 
-    @property
-    def MODE(self) -> str:
-        return self.EXECUTION_MODE
+
+@dataclass
+class BinanceConfig:
+    API_KEY: str = os.getenv("BINANCE_API_KEY", "").strip()
+    API_SECRET: str = os.getenv("BINANCE_API_SECRET", "").strip()
+    BASE_URL: str = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").strip()
+    RECV_WINDOW: int = int(os.getenv("BINANCE_RECV_WINDOW", "5000"))
+    TESTNET: bool = os.getenv("BINANCE_TESTNET", "0") == "1"
 
 
 @dataclass
 class TradeConfig:
+    # Universe
+    QUOTE_ASSET: str = "USDT"
+    MAX_SYMBOLS: int = int(os.getenv("MAX_SYMBOLS", "60"))
 
-    # =========================
-    # TIMEFRAMES
-    # =========================
-    HTF_INTERVAL: str = "1d"
-    MTF_INTERVAL: str = "4h"
-    LTF_INTERVAL: str = "1h"
-    MICRO_INTERVAL: str = "15m"
+    # Timeframes
+    HTF_INTERVAL: str = os.getenv("HTF_INTERVAL", "1d")
+    MTF_INTERVAL: str = os.getenv("MTF_INTERVAL", "4h")
+    LTF_INTERVAL: str = os.getenv("LTF_INTERVAL", "1h")
+    MICRO_INTERVAL: str = os.getenv("MICRO_INTERVAL", "15m")
+    KLINE_LIMIT: int = int(os.getenv("KLINE_LIMIT", "240"))
 
-    KLINE_LIMIT: int = 220
+    # Indicators
+    EMA_FAST: int = int(os.getenv("EMA_FAST", "20"))
+    EMA_MID: int = int(os.getenv("EMA_MID", "50"))
+    EMA_SLOW: int = int(os.getenv("EMA_SLOW", "200"))
+    ATR_PERIOD: int = int(os.getenv("ATR_PERIOD", "14"))
+    SWING_LOOKBACK: int = int(os.getenv("SWING_LOOKBACK", "8"))
+    BREAKOUT_LOOKBACK: int = int(os.getenv("BREAKOUT_LOOKBACK", "20"))
 
-    # =========================
-    # INDICATORS
-    # =========================
-    ATR_PERIOD: int = 14
-    EMA_FAST: int = 20
-    EMA_MID: int = 50
+    # Core filters
+    SCORE_MIN: int = int(os.getenv("SCORE_MIN", "5"))
+    RR_MIN: float = float(os.getenv("RR_MIN", "2.2"))
+    RR_IDEAL: float = float(os.getenv("RR_IDEAL", "2.8"))
+    MIN_EXPECTED_NET_PNL_PCT: float = float(os.getenv("MIN_EXPECTED_NET_PNL_PCT", "1.20"))
+    MIN_STOP_PCT: float = float(os.getenv("MIN_STOP_PCT", "0.75"))
+    MAX_STOP_PCT: float = float(os.getenv("MAX_STOP_PCT", "3.80"))
+    MIN_TP_PCT: float = float(os.getenv("MIN_TP_PCT", "1.80"))
+    MAX_TP_PCT: float = float(os.getenv("MAX_TP_PCT", "8.50"))
+    MIN_VOLUME_USDT_24H: float = float(os.getenv("MIN_VOLUME_USDT_24H", "5000000"))
+    MAX_SPREAD_PCT: float = float(os.getenv("MAX_SPREAD_PCT", "0.20"))
+    MAX_FUNDING_ABS_PCT: float = float(os.getenv("MAX_FUNDING_ABS_PCT", "0.08"))
 
-    # =========================
-    # STRUCTURE / SETUP
-    # =========================
+    # Old switch kept for compatibility, but no longer the main idea
+    SKIP_RANGE_DAILY: bool = os.getenv("SKIP_RANGE_DAILY", "0") == "1"
 
-    MIN_NET_PROFIT_PCT: float = 0.0035  # 0.35%
-    MIN_NET_PROFIT_USDT: float = 0.35  # minimum expected net dollars per trade
-    MIN_NET_RR: float = 1.25  # fee-adjusted RR floor
+    # Adaptive regime switches
+    ENABLE_REGIME_FILTER: bool = os.getenv("ENABLE_REGIME_FILTER", "1") == "1"
+    ALLOW_RANGE_PULLBACKS: bool = os.getenv("ALLOW_RANGE_PULLBACKS", "1") == "1"
+    ALLOW_RANGE_BREAKOUTS: bool = os.getenv("ALLOW_RANGE_BREAKOUTS", "0") == "1"
 
-    NET_PROFIT_MODE: bool = True
+    # Stricter rules during daily range
+    RANGE_SCORE_MIN: int = int(os.getenv("RANGE_SCORE_MIN", "6"))
+    RANGE_RR_MIN: float = float(os.getenv("RANGE_RR_MIN", "2.4"))
+    RANGE_MIN_EXPECTED_NET_PNL_PCT: float = float(os.getenv("RANGE_MIN_EXPECTED_NET_PNL_PCT", "1.40"))
 
-    BINANCE_FEE_MAKER: float = 0.0002  # 0.02%
-    BINANCE_FEE_TAKER: float = 0.0004  # 0.04%
+    # Execution / sizing
+    MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
+    USDT_PER_TRADE: float = float(os.getenv("USDT_PER_TRADE", "75"))
+    LEVERAGE: int = int(os.getenv("LEVERAGE", "3"))
+    USE_LIMIT_ENTRY: bool = os.getenv("USE_LIMIT_ENTRY", "1") == "1"
+    ENTRY_BUFFER_BPS: float = float(os.getenv("ENTRY_BUFFER_BPS", "4"))
+    SL_BUFFER_BPS: float = float(os.getenv("SL_BUFFER_BPS", "6"))
+    TP_BUFFER_BPS: float = float(os.getenv("TP_BUFFER_BPS", "6"))
 
-    # how your entry/exit usually execute
-    ENTRY_FEE_RATE: float = 0.0004  # stop-limit can still behave like taker often
-    EXIT_FEE_RATE: float = 0.0004  # tp/sl execution usually assume taker for safety
+    # Costs
+    MAKER_FEE_PCT: float = float(os.getenv("MAKER_FEE_PCT", "0.02"))
+    TAKER_FEE_PCT: float = float(os.getenv("TAKER_FEE_PCT", "0.05"))
+    ROUND_TRIP_SLIPPAGE_PCT: float = float(os.getenv("ROUND_TRIP_SLIPPAGE_PCT", "0.08"))
 
-    # minimum net profit after commissions
-    MIN_NET_PROFIT_PCT: float = 0.003  # 0.30%
+    # Position management
+    BREAK_EVEN_TRIGGER_R: float = float(os.getenv("BREAK_EVEN_TRIGGER_R", "1.0"))
+    TRAIL_AFTER_R: float = float(os.getenv("TRAIL_AFTER_R", "1.5"))
+    PARTIAL_TP_AT_R: float = float(os.getenv("PARTIAL_TP_AT_R", "1.2"))
+    PARTIAL_CLOSE_RATIO: float = float(os.getenv("PARTIAL_CLOSE_RATIO", "0.40"))
+    ENABLE_TRAILING: bool = os.getenv("ENABLE_TRAILING", "1") == "1"
 
-    # optional safety cushion for spread/slippage
-    EXTRA_COST_PCT: float = 0.0005  # 0.05%
+    # Loops
+    ORDER_LOOP_SECONDS: int = int(os.getenv("ORDER_LOOP_SECONDS", "300"))
+    POSITION_LOOP_SECONDS: int = int(os.getenv("POSITION_LOOP_SECONDS", "4"))
 
-    SWING_LOOKBACK: int = 6
-    BREAKOUT_LOOKBACK: int = 20
+    # Logging and notifications
+    TELEGRAM_ALERTS: bool = os.getenv("TELEGRAM_ALERTS", "1") == "1"
+    ORDER_ALERT: bool = os.getenv("ORDER_ALERT", "1") == "1"
 
-    PULLBACK_ZONE_BUFFER_PCT: float = 0.0015
-    BREAKOUT_BUFFER_PCT: float = 0.0010
-    SL_BUFFER_PCT: float = 0.0010
-    TP_R_MULTIPLIER: float = 2.0
 
-    # legacy / compatibility
-    ZONE_PADDING_PCT: float = 0.0015
-    SL_BUFFER_ATR_MULTIPLIER: float = 0.8
-    TP_ATR_MULTIPLIER: float = 2.2
+@dataclass
+class FileConfig:
+    OPEN_ORDERS_CSV: str = "data/open_orders.csv"
+    OPEN_POSITIONS_CSV: str = "data/open_positions.csv"
+    CLOSED_POSITIONS_CSV: str = "data/closed_positions.csv"
+    SYMBOL_META_JSON: str = "data/symbol_meta.json"
+    MARKET_CACHE_JSON: str = "data/market_cache.json"
 
-    # =========================
-    # RISK / FILTERS
-    # =========================
-    RR_MIN: float = 1.6
-    RR_DEFAULT: float = 2.0
-
-    MIN_SL_PCT: float = 0.002
-    MAX_SL_PCT: float = 0.05
-    RISK_PER_TRADE_PCT: float = 0.01
-
-    MIN_SCORE: int = 2
-    BLOCK_DUPLICATE_SYMBOL_STATE: bool = False
-
-    # =========================
-    # SCAN / ORDER ENGINE
-    # =========================
-    DEFAULT_SCAN_TOP_VOL: int = 100
-    SAFE_SCAN_TOP_VOL: int = 50
-
-    MAX_OPEN_ORDERS: int = 30
-    MAX_CANDIDATES_PER_CYCLE: int = 30
-
-    REPRICE_THRESHOLD_PCT: float = 0.0015
-
-    ORDER_USDT_SIZE: float = 100.0
-    ENTRY_LONG_BUFFER_PCT: float = 0.0003
-    ENTRY_SHORT_BUFFER_PCT: float = 0.0003
-    WORKING_TYPE: str = "CONTRACT_PRICE"
-
-    ALLOW_REPLACE_ARMED_ORDER: bool = True
-    ALLOW_SIDE_FLIP_REPLACEMENT: bool = True
-
-    # =========================
-    # FILES / LOGS
-    # =========================
     ORDER_LOG_FILE: str = "logs/order.log"
     POSITION_LOG_FILE: str = "logs/position.log"
-    EVENT_LOG_FILE = "logs/event_log.csv"
-
-    WS_URL: str = "wss://fstream.binance.com/ws/!ticker@arr"
-
-    PAPER_OPEN_ORDERS_FILE: str = "data/open_orders.csv"
-    PAPER_CLOSED_ORDERS_FILE: str = "data/closed_orders.csv"
-    PAPER_OPEN_POSITIONS_FILE: str = "data/open_positions.csv"
-    PAPER_CLOSED_POSITIONS_FILE: str = "data/closed_positions.csv"
-
-    REAL_OPEN_ORDERS_FILE: str = "data/real_open_orders.csv"
-    REAL_CLOSED_ORDERS_FILE: str = "data/real_closed_orders.csv"
-    REAL_OPEN_POSITIONS_FILE: str = "data/real_open_positions.csv"
-    REAL_CLOSED_POSITIONS_FILE: str = "data/real_closed_positions.csv"
+    ENGINE_LOG_FILE: str = "logs/engine.log"
 
 
 @dataclass
-class AlarmConfig:
-    TOUCHED_ORDER_ENABLED: bool = True
-    NEAR_TRIGGER_ENABLED: bool = True
-    NEAR_TRIGGER_PCT: float = 0.002
-    TOUCHED_EMOJI: str = "🟡"
-    TRIGGER_EMOJI: str = "🟠"
-
-
-@dataclass
-class WSSSLConfig:
-    VERIFY_CERT: bool = True
-    ALLOW_INSECURE_FALLBACK: bool = True
-
-
-@dataclass
-class AdaptiveConfig:
-    SCORE_FILE: str = "data/score.txt"
-
-    AUTO_SAFE_THRESHOLD: int = -3
-    AUTO_BALANCED_THRESHOLD: int = 2
-    # score <= -3 => SAFE
-    # -2 .. 1     => BALANCED
-    # >= 2        => AGGRESSIVE
-
-
 class Config:
-    ENGINE = EngineConfig()
-    TRADE = TradeConfig()
-    ALARM = AlarmConfig()
-    WS_SSL = WSSSLConfig()
-    ADAPTIVE = AdaptiveConfig()
-
-
-    def get_mode_settings(self, score: int = 0) -> dict:
-        strategy_mode = self.ENGINE.STRATEGY_MODE.upper()
-
-        if strategy_mode == "AGGRESSIVE":
-            return {
-                "NAME": "AGGRESSIVE",
-                "MIN_SIGNAL_SCORE": 2,
-                "MAX_OPEN_POSITIONS": 10,
-                "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,   # 200
-            }
-
-        if strategy_mode == "BALANCED":
-            return {
-                "NAME": "BALANCED",
-                "MIN_SIGNAL_SCORE": 4,
-                "MAX_OPEN_POSITIONS": 7,
-                "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,   # 200
-            }
-
-        if strategy_mode == "SAFE":
-            return {
-                "NAME": "SAFE",
-                "MIN_SIGNAL_SCORE": 4,
-                "MAX_OPEN_POSITIONS": 4,
-                "MAX_SYMBOLS_SCAN": self.TRADE.SAFE_SCAN_TOP_VOL,      # 50
-            }
-
-        if strategy_mode == "AUTO":
-            if score <= self.ADAPTIVE.AUTO_SAFE_THRESHOLD:
-                return {
-                    "NAME": "SAFE",
-                    "MIN_SIGNAL_SCORE": 3,
-                    "MAX_OPEN_POSITIONS": 4,
-                    "MAX_SYMBOLS_SCAN": self.TRADE.SAFE_SCAN_TOP_VOL,  # 50
-                }
-
-            if score >= self.ADAPTIVE.AUTO_BALANCED_THRESHOLD:
-                return {
-                    "NAME": "AGGRESSIVE",
-                    "MIN_SIGNAL_SCORE": 2,
-                    "MAX_OPEN_POSITIONS": 10,
-                    "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,  # 200
-                }
-
-            return {
-                "NAME": "BALANCED",
-                "MIN_SIGNAL_SCORE": 4,
-                "MAX_OPEN_POSITIONS": 7,
-                "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,   # 200
-            }
-
-        return {
-            "NAME": "BALANCED",
-            "MIN_SIGNAL_SCORE": 4,
-            "MAX_OPEN_POSITIONS": 7,
-            "MAX_SYMBOLS_SCAN": self.TRADE.DEFAULT_SCAN_TOP_VOL,       # 200
-        }
+    ENGINE: EngineConfig = field(default_factory=EngineConfig)
+    BINANCE: BinanceConfig = field(default_factory=BinanceConfig)
+    TRADE: TradeConfig = field(default_factory=TradeConfig)
+    FILES: FileConfig = field(default_factory=FileConfig)
 
 
 CONFIG = Config()
