@@ -1,463 +1,353 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-from __future__ import annotations
-
-import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from env import load_env
-load_env()
-
-from config import CONFIG
-from utils import (
-    append_closed_position,
-    append_open_position,
-    fmt_price,
-    get_open_positions,
-    has_existing_position,
-    is_real_mode,
-    load_open_orders,
-    log_event,
-    log_message,
-    now_utc,
-    safe_get_live_price,
-    save_open_positions,
-    to_float,
-    write_open_orders,
-)
-from telegram_alert import (
-    build_open_position_message,
-    build_sl_message,
-    build_tp_message,
-    send_telegram_message,
-)
 from binance_real import BinanceFuturesClient
-
-
-client = BinanceFuturesClient(
-    api_key=os.getenv("BINANCE_API_KEY", "").strip(),
-    api_secret=os.getenv("BINANCE_API_SECRET", "").strip(),
-    testnet=os.getenv("BINANCE_TESTNET", "true").strip().lower() == "true",
+from config import CONFIG
+from telegram_alert import alert_position_closed, alert_position_opened, alert_position_update
+from market import get_symbol_meta, get_market_snapshot
+from utils import (
+    compute_rr,
+    expected_net_pnl_pct,
+    log_message,
+    new_position_id,
+    order_fieldnames,
+    pct_change,
+    position_fieldnames,
+    price_in_zone,
+    read_csv,
+    round_step,
+    round_tick,
+    safe_float,
+    utc_now_str,
+    write_csv,
 )
 
-POSITION_LOG_FILE = CONFIG.TRADE.POSITION_LOG_FILE
-WORKING_TYPE = getattr(CONFIG.TRADE, "WORKING_TYPE", "CONTRACT_PRICE")
-
-ENTRY_FEE_RATE = getattr(CONFIG.TRADE, "ENTRY_FEE_RATE", 0.0004)
-EXIT_FEE_RATE = getattr(CONFIG.TRADE, "EXIT_FEE_RATE", 0.0004)
+client = BinanceFuturesClient()
 
 
-def calc_fees_usdt(entry: float, exit_price: float, qty: float) -> float:
-    entry_notional = entry * qty
-    exit_notional = exit_price * qty
-    return (entry_notional * ENTRY_FEE_RATE) + (exit_notional * EXIT_FEE_RATE)
+def load_open_orders() -> List[Dict[str, Any]]:
+    rows = read_csv(CONFIG.FILES.OPEN_ORDERS_CSV)
+    return rows
 
 
-def calc_real_pnl_usdt(entry: float, exit_price: float, qty: float, side: str) -> float:
-    side = str(side).upper()
-    if side == "LONG":
-        gross = (exit_price - entry) * qty
-    else:
-        gross = (entry - exit_price) * qty
-    return gross - calc_fees_usdt(entry, exit_price, qty)
+def save_open_orders(rows: List[Dict[str, Any]]) -> None:
+    write_csv(CONFIG.FILES.OPEN_ORDERS_CSV, rows, order_fieldnames())
 
 
-def calc_real_pnl_pct(entry: float, exit_price: float, side: str) -> float:
-    if entry <= 0:
-        return 0.0
-    side = str(side).upper()
-    if side == "LONG":
-        gross_pct = (exit_price - entry) / entry
-    else:
-        gross_pct = (entry - exit_price) / entry
-    return (gross_pct - ENTRY_FEE_RATE - EXIT_FEE_RATE) * 100
+def load_open_positions() -> List[Dict[str, Any]]:
+    rows = read_csv(CONFIG.FILES.OPEN_POSITIONS_CSV)
+    return rows
 
 
-def get_live_price(symbol: str) -> float:
-    price = safe_get_live_price(symbol)
-    if price is None:
-        log_message(f"LIVE_PRICE_FETCH_FAIL {symbol}", POSITION_LOG_FILE)
-        return 0.0
-    return float(price)
+def save_open_positions(rows: List[Dict[str, Any]]) -> None:
+    write_csv(CONFIG.FILES.OPEN_POSITIONS_CSV, rows, position_fieldnames())
 
 
-def get_real_position(symbol: str) -> Optional[Dict[str, Any]]:
-    try:
-        rows = client.position_risk(symbol=symbol)
-        if isinstance(rows, dict):
-            rows = [rows]
-
-        for row in rows:
-            qty = abs(float(row.get("positionAmt", 0) or 0))
-            if qty > 0:
-                return row
-        return None
-    except Exception as e:
-        log_message(f"POSITION_RISK_FAIL {symbol} error={e}", POSITION_LOG_FILE)
-        return None
+def load_closed_positions() -> List[Dict[str, Any]]:
+    return read_csv(CONFIG.FILES.CLOSED_POSITIONS_CSV)
 
 
-def has_open_exchange_entry_order(symbol: str, exchange_order_id: str) -> bool:
-    if not exchange_order_id:
-        return False
-
-    try:
-        orders = client.open_orders(symbol=symbol)
-        for order in orders:
-            if str(order.get("orderId", "")) == str(exchange_order_id):
-                return True
-            if str(order.get("algoId", "")) == str(exchange_order_id):
-                return True
-        return False
-    except Exception as e:
-        log_message(
-            f"OPEN_ORDER_CHECK_FAIL {symbol} exchange_order_id={exchange_order_id} error={e}",
-            POSITION_LOG_FILE,
-        )
-        return False
+def save_closed_positions(rows: List[Dict[str, Any]]) -> None:
+    write_csv(CONFIG.FILES.CLOSED_POSITIONS_CSV, rows, position_fieldnames() + ["closed_at", "close_reason", "close_price"])
 
 
-def place_stop_loss_order(pos: Dict[str, Any]) -> str:
-    symbol = pos["symbol"]
-    side = str(pos["side"]).upper()
-    sl = float(pos["sl"])
-    qty = abs(float(pos["qty"]))
-    close_side = "SELL" if side == "LONG" else "BUY"
+def calc_qty(symbol: str, entry: float, symbol_meta: Dict[str, Any]) -> float:
+    notional = CONFIG.TRADE.USDT_PER_TRADE * CONFIG.TRADE.LEVERAGE
+    raw_qty = notional / entry if entry > 0 else 0.0
+    qty = round_step(raw_qty, symbol_meta["qty_step"])
+    if qty < symbol_meta["min_qty"]:
+        qty = symbol_meta["min_qty"]
+    return qty
 
-    resp = client.place_stop_market_order(
+
+def side_to_binance(side: str) -> str:
+    return "BUY" if side.upper() == "LONG" else "SELL"
+
+
+def close_side_to_binance(side: str) -> str:
+    return "SELL" if side.upper() == "LONG" else "BUY"
+
+
+def arm_protection(symbol: str, side: str, qty: float, sl: float, tp: float) -> Dict[str, Any]:
+    sl_side = close_side_to_binance(side)
+    tp_side = close_side_to_binance(side)
+
+    sl_order = client.place_stop_market(
         symbol=symbol,
-        side=close_side,
-        trigger_price=sl,
-        quantity=qty,
-        close_position=None,
-        position_side=None,
-        working_type=WORKING_TYPE,
-    )
-    return str(resp.get("algoId") or resp.get("orderId") or "")
-
-
-def place_take_profit_order(pos: Dict[str, Any]) -> str:
-    symbol = pos["symbol"]
-    side = str(pos["side"]).upper()
-    tp = float(pos["tp"])
-    qty = abs(float(pos["qty"]))
-    close_side = "SELL" if side == "LONG" else "BUY"
-
-    resp = client.place_limit_order(
-        symbol=symbol,
-        side=close_side,
-        quantity=qty,
-        price=tp,
-        time_in_force="GTC",
+        side=sl_side,
+        stop_price=sl,
         reduce_only=True,
+        quantity=qty,
     )
-    return str(resp.get("orderId") or "")
-
-
-def build_position_from_order(order: Dict[str, Any], real_pos: Dict[str, Any]) -> Dict[str, Any]:
-    qty_signed = float(real_pos.get("positionAmt", 0) or 0)
-    qty = abs(qty_signed)
-    entry = float(real_pos.get("entryPrice", 0) or 0)
+    tp_order = client.place_take_profit_market(
+        symbol=symbol,
+        side=tp_side,
+        stop_price=tp,
+        reduce_only=True,
+        quantity=qty,
+    )
 
     return {
-        "position_id": order.get("order_id", ""),
-        "order_id": order.get("exchange_order_id", ""),
-        "symbol": order["symbol"],
-        "side": order["side"],
-        "entry": fmt_price(entry),
-        "qty": str(qty),
-        "sl": order["sl"],
-        "tp": order["tp"],
-        "rr": order.get("rr", ""),
-        "score": order.get("score", "0"),
-        "tf_context": order.get("tf_context", ""),
-        "setup_type": order.get("setup_type", ""),
-        "setup_reason": order.get("setup_reason", ""),
-        "opened_at": now_utc(),
-        "updated_at": now_utc(),
-        "status": "OPEN_POSITION",
-        "live_price": fmt_price(entry),
-        "pnl_pct": "0.0000",
-        "net_pnl_pct": "0.0000",
-        "net_pnl_usdt": "0.0000",
-        "fees_usdt": "0.0000",
-        "sl_order_id": "",
-        "tp_order_id": "",
-        "protection_armed": "0",
+        "sl_order_id": str(sl_order.get("orderId", "")),
+        "tp_order_id": str(tp_order.get("orderId", "")),
     }
 
 
-def reconcile_armed_orders() -> None:
-    open_orders = load_open_orders()
-    changed = False
-    remaining_orders: List[Dict[str, Any]] = []
+def open_position_from_order(order: Dict[str, Any], live_price: float, symbol_meta: Dict[str, Any]) -> Dict[str, Any]:
+    entry = safe_float(order["entry_trigger"])
+    qty = calc_qty(order["symbol"], entry, symbol_meta)
 
-    for order in open_orders:
-        status = str(order.get("status", "OPEN_ORDER"))
-        if status != "ARMED_ORDER":
-            remaining_orders.append(order)
+    client.set_leverage(order["symbol"], CONFIG.TRADE.LEVERAGE)
+
+    if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
+        if CONFIG.TRADE.USE_LIMIT_ENTRY:
+            price = round_tick(entry, symbol_meta["price_tick"])
+            client.place_limit_order(
+                symbol=order["symbol"],
+                side=side_to_binance(order["side"]),
+                quantity=qty,
+                price=price,
+                reduce_only=False,
+            )
+        else:
+            client.place_market_order(
+                symbol=order["symbol"],
+                side=side_to_binance(order["side"]),
+                quantity=qty,
+                reduce_only=False,
+            )
+
+    protection = {"sl_order_id": "", "tp_order_id": ""}
+    if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
+        protection = arm_protection(
+            symbol=order["symbol"],
+            side=order["side"],
+            qty=qty,
+            sl=round_tick(safe_float(order["sl"]), symbol_meta["price_tick"]),
+            tp=round_tick(safe_float(order["tp"]), symbol_meta["price_tick"]),
+        )
+
+    now = utc_now_str()
+    return {
+        "position_id": new_position_id(order["symbol"], order["side"]),
+        "order_id": order["order_id"],
+        "symbol": order["symbol"],
+        "side": order["side"],
+        "entry": round(entry, 8),
+        "qty": round(qty, 8),
+        "sl": round(safe_float(order["sl"]), 8),
+        "tp": round(safe_float(order["tp"]), 8),
+        "rr": order["rr"],
+        "score": order["score"],
+        "tf_context": order["tf_context"],
+        "setup_type": order["setup_type"],
+        "setup_reason": order["setup_reason"],
+        "opened_at": now,
+        "updated_at": now,
+        "status": "OPEN_POSITION",
+        "live_price": round(live_price, 8),
+        "pnl_pct": 0.0,
+        "net_pnl_pct": 0.0,
+        "net_pnl_usdt": 0.0,
+        "fees_usdt": 0.0,
+        "sl_order_id": protection["sl_order_id"],
+        "tp_order_id": protection["tp_order_id"],
+        "protection_armed": 1 if protection["sl_order_id"] or protection["tp_order_id"] else 0,
+        "partial_taken": 0,
+        "break_even_armed": 0,
+        "highest_price": round(live_price, 8),
+        "lowest_price": round(live_price, 8),
+    }
+
+
+def process_orders_into_positions() -> None:
+    orders = load_open_orders()
+    positions = load_open_positions()
+    symbol_meta_all = get_symbol_meta()
+
+    active_symbols = {p["symbol"] for p in positions if p.get("status") == "OPEN_POSITION"}
+
+    for order in orders:
+        if order.get("status") != "OPEN_ORDER":
+            continue
+        if order["symbol"] in active_symbols:
             continue
 
-        symbol = order["symbol"]
-        side = order["side"]
-        exchange_order_id = str(order.get("exchange_order_id", "")).strip()
+        try:
+            market = get_market_snapshot(order["symbol"])
+            live_price = safe_float(market["price"])
+            order["live_price"] = round(live_price, 8)
+            order["updated_at"] = utc_now_str()
 
-        if is_real_mode():
-            real_pos = get_real_position(symbol)
+            zone_low = safe_float(order["entry_zone_low"])
+            zone_high = safe_float(order["entry_zone_high"])
 
-            if real_pos is not None:
-                if not has_existing_position(symbol):
-                    pos = build_position_from_order(order, real_pos)
+            if price_in_zone(live_price, zone_low, zone_high):
+                order["zone_touched"] = 1
 
-                    try:
-                        sl_id = place_stop_loss_order(pos)
-                        tp_id = place_take_profit_order(pos)
-                        pos["sl_order_id"] = sl_id
-                        pos["tp_order_id"] = tp_id
-                        pos["protection_armed"] = "1"
-                    except Exception as e:
-                        log_message(f"PROTECTION_ARM_FAIL {symbol} {side} error={e}", POSITION_LOG_FILE)
-
-                    append_open_position(pos)
-
-                    log_message(
-                        f"ENTRY FILLED {symbol} {side} entry={pos['entry']} qty={pos['qty']} "
-                        f"sl={pos['sl']} tp={pos['tp']} exchange_order_id={exchange_order_id}",
-                        POSITION_LOG_FILE,
-                    )
-                    log_event(
-                        "ENTRY_FILLED",
-                        symbol,
-                        side,
-                        f"entry={pos['entry']} qty={pos['qty']} sl={pos['sl']} tp={pos['tp']} "
-                        f"exchange_order_id={exchange_order_id}",
-                        int(pos.get("score", 0)),
-                    )
-
-                    try:
-                        send_telegram_message(build_open_position_message(pos))
-                    except Exception as e:
-                        log_message(f"TELEGRAM_OPEN_POSITION_FAIL {symbol} error={e}", POSITION_LOG_FILE)
-
-                    changed = True
-                    continue
-
-                changed = True
+            if not price_in_zone(live_price, zone_low, zone_high):
                 continue
 
-            if exchange_order_id and has_open_exchange_entry_order(symbol, exchange_order_id):
-                remaining_orders.append(order)
+            entry = safe_float(order["entry_trigger"])
+            if order["side"] == "LONG" and live_price > entry * 1.003:
+                continue
+            if order["side"] == "SHORT" and live_price < entry * 0.997:
                 continue
 
-            order["status"] = "CANCELLED"
-            order["updated_at"] = now_utc()
-            changed = True
+            symbol_meta = symbol_meta_all.get(order["symbol"])
+            if not symbol_meta:
+                continue
+
+            pos = open_position_from_order(order, live_price, symbol_meta)
+            positions.append(pos)
+
+            order["status"] = "FILLED_TO_POSITION"
+            alert_position_opened(pos)
 
             log_message(
-                f"ARMED ORDER GONE {symbol} {side} exchange_order_id={exchange_order_id}",
-                POSITION_LOG_FILE,
+                f"ORDER_TO_POSITION {order['symbol']} {order['side']} entry={pos['entry']} qty={pos['qty']}",
+                CONFIG.FILES.POSITION_LOG_FILE,
             )
-            log_event(
-                "ARMED_ORDER_GONE",
-                symbol,
-                side,
-                f"exchange_order_id={exchange_order_id}",
-                int(order.get("score", 0)),
-            )
-            continue
 
-        live_price = get_live_price(symbol)
-        trigger = to_float(order.get("entry_trigger", 0))
-
-        if live_price <= 0 or trigger <= 0:
-            remaining_orders.append(order)
-            continue
-
-        filled = (side == "LONG" and live_price >= trigger) or (side == "SHORT" and live_price <= trigger)
-
-        if filled:
-            pos = {
-                "position_id": order.get("order_id", ""),
-                "order_id": order.get("exchange_order_id", ""),
-                "symbol": symbol,
-                "side": side,
-                "entry": fmt_price(trigger),
-                "qty": "0",
-                "sl": order["sl"],
-                "tp": order["tp"],
-                "rr": order.get("rr", ""),
-                "score": order.get("score", "0"),
-                "tf_context": order.get("tf_context", ""),
-                "setup_type": order.get("setup_type", ""),
-                "setup_reason": order.get("setup_reason", ""),
-                "opened_at": now_utc(),
-                "updated_at": now_utc(),
-                "status": "OPEN_POSITION",
-                "live_price": fmt_price(live_price),
-                "pnl_pct": "0.0000",
-                "net_pnl_pct": "0.0000",
-                "net_pnl_usdt": "0.0000",
-                "fees_usdt": "0.0000",
-                "sl_order_id": "",
-                "tp_order_id": "",
-                "protection_armed": "1",
-            }
-            append_open_position(pos)
-
+        except Exception as e:
             log_message(
-                f"PAPER ENTRY FILLED {symbol} {side} entry={pos['entry']} trigger={trigger}",
-                POSITION_LOG_FILE,
+                f"ORDER_TO_POSITION_FAIL {order.get('symbol')} error={e}",
+                CONFIG.FILES.POSITION_LOG_FILE,
             )
-            log_event(
-                "ENTRY_FILLED",
-                symbol,
-                side,
-                f"entry={pos['entry']} trigger={trigger}",
-                int(pos.get("score", 0)),
-            )
-            changed = True
-            continue
 
-        remaining_orders.append(order)
-
-    if changed:
-        write_open_orders(remaining_orders)
-
-
-def archive_position(pos: Dict[str, Any], status: str, live_price: float, pnl_pct: float) -> None:
-    entry = float(pos.get("entry", 0) or 0)
-    qty = float(pos.get("qty", 0) or 0)
-
-    fees_usdt = calc_fees_usdt(entry, live_price, qty) if qty > 0 else 0.0
-    net_pnl_usdt = calc_real_pnl_usdt(entry, live_price, qty, pos["side"]) if qty > 0 else 0.0
-    net_pnl_pct = calc_real_pnl_pct(entry, live_price, pos["side"])
-
-    pos["status"] = status
-    pos["live_price"] = fmt_price(live_price)
-    pos["pnl_pct"] = f"{pnl_pct:.4f}"
-    pos["net_pnl_pct"] = f"{net_pnl_pct:.4f}"
-    pos["net_pnl_usdt"] = f"{net_pnl_usdt:.4f}"
-    pos["fees_usdt"] = f"{fees_usdt:.4f}"
-    pos["updated_at"] = now_utc()
-
-    append_closed_position(pos)
-
-    log_message(
-        f"{status} {pos['symbol']} {pos['side']} entry={pos['entry']} "
-        f"sl={pos['sl']} tp={pos['tp']} live={fmt_price(live_price)} "
-        f"gross={pnl_pct:.4f}% net={net_pnl_pct:.4f}% fees={fees_usdt:.4f}USDT",
-        POSITION_LOG_FILE,
-    )
-    log_event(
-        status,
-        pos["symbol"],
-        pos["side"],
-        f"entry={pos['entry']} sl={pos['sl']} tp={pos['tp']} "
-        f"live={fmt_price(live_price)} gross={pnl_pct:.4f}% net={net_pnl_pct:.4f}%",
-        int(pos.get("score", 0)),
-    )
-
-    if status == "TP_HIT":
-        try:
-            send_telegram_message(build_tp_message(pos))
-        except Exception as e:
-            log_message(f"TELEGRAM_TP_FAIL {pos['symbol']} error={e}", POSITION_LOG_FILE)
-    elif status == "SL_HIT":
-        try:
-            send_telegram_message(build_sl_message(pos))
-        except Exception as e:
-            log_message(f"TELEGRAM_SL_FAIL {pos['symbol']} error={e}", POSITION_LOG_FILE)
+    save_open_orders(orders)
+    save_open_positions(positions)
 
 
 def update_positions() -> None:
-    positions = get_open_positions()
-    alive: List[Dict[str, Any]] = []
+    positions = load_open_positions()
+    closed = load_closed_positions()
+    updated_positions: List[Dict[str, Any]] = []
 
     for pos in positions:
-        symbol = pos["symbol"]
-        side = str(pos["side"]).upper()
+        if pos.get("status") != "OPEN_POSITION":
+            continue
 
         try:
-            entry = float(pos.get("entry", 0) or 0)
-            sl = float(pos.get("sl", 0) or 0)
-            tp = float(pos.get("tp", 0) or 0)
-        except Exception:
-            alive.append(pos)
-            continue
+            market = get_market_snapshot(pos["symbol"])
+            live_price = safe_float(market["price"])
+            entry = safe_float(pos["entry"])
+            qty = safe_float(pos["qty"])
+            side = pos["side"]
+            sl = safe_float(pos["sl"])
+            tp = safe_float(pos["tp"])
 
-        if entry <= 0:
-            alive.append(pos)
-            continue
+            gross_pct = pct_change(entry, live_price, side)
+            fees_pct = CONFIG.TRADE.MAKER_FEE_PCT + CONFIG.TRADE.TAKER_FEE_PCT + CONFIG.TRADE.ROUND_TRIP_SLIPPAGE_PCT
+            net_pct = gross_pct - fees_pct
+            notional = entry * qty
+            net_usdt = (net_pct / 100.0) * notional
+            fees_usdt = (fees_pct / 100.0) * notional
 
-        live_price = get_live_price(symbol)
-        if live_price <= 0:
-            alive.append(pos)
-            continue
+            pos["live_price"] = round(live_price, 8)
+            pos["pnl_pct"] = round(gross_pct, 4)
+            pos["net_pnl_pct"] = round(net_pct, 4)
+            pos["net_pnl_usdt"] = round(net_usdt, 4)
+            pos["fees_usdt"] = round(fees_usdt, 4)
+            pos["updated_at"] = utc_now_str()
 
-        pos["live_price"] = fmt_price(live_price)
-        pos["updated_at"] = now_utc()
+            pos["highest_price"] = max(safe_float(pos.get("highest_price")), live_price)
+            old_lowest = safe_float(pos.get("lowest_price"))
+            pos["lowest_price"] = live_price if old_lowest == 0 else min(old_lowest, live_price)
 
-        if side == "LONG":
-            pnl_pct = ((live_price - entry) / entry) * 100
-            tp_hit_by_price = live_price >= tp if tp > 0 else False
-            sl_hit_by_price = live_price <= sl if sl > 0 else False
-        else:
-            pnl_pct = ((entry - live_price) / entry) * 100
-            tp_hit_by_price = live_price <= tp if tp > 0 else False
-            sl_hit_by_price = live_price >= sl if sl > 0 else False
+            risk = abs(entry - sl)
+            one_r = risk if risk > 0 else 0.0
+            progress_r = abs(live_price - entry) / one_r if one_r > 0 else 0.0
 
-        pos["pnl_pct"] = f"{pnl_pct:.4f}"
+            # Break-even logic
+            if CONFIG.TRADE.ENABLE_TRAILING and not int(float(pos.get("break_even_armed", 0))):
+                if progress_r >= CONFIG.TRADE.BREAK_EVEN_TRIGGER_R:
+                    pos["sl"] = round(entry, 8)
+                    pos["break_even_armed"] = 1
+                    log_message(
+                        f"BREAK_EVEN_ARMED {pos['symbol']} side={side} entry={entry}",
+                        CONFIG.FILES.POSITION_LOG_FILE,
+                    )
 
-        if is_real_mode():
-            real_pos = get_real_position(symbol)
-
-            if real_pos is None:
-                if tp_hit_by_price:
-                    archive_position(pos, "TP_HIT", live_price, pnl_pct)
-                elif sl_hit_by_price:
-                    archive_position(pos, "SL_HIT", live_price, pnl_pct)
+            # Trailing logic
+            if CONFIG.TRADE.ENABLE_TRAILING and progress_r >= CONFIG.TRADE.TRAIL_AFTER_R:
+                if side == "LONG":
+                    trail_sl = live_price - (one_r * 0.80)
+                    if trail_sl > safe_float(pos["sl"]):
+                        pos["sl"] = round(trail_sl, 8)
                 else:
-                    archive_position(pos, "CLOSED_ON_BINANCE", live_price, pnl_pct)
-                continue
+                    trail_sl = live_price + (one_r * 0.80)
+                    if trail_sl < safe_float(pos["sl"]):
+                        pos["sl"] = round(trail_sl, 8)
 
-            alive.append(pos)
-            continue
+            close_reason = None
 
-        if tp_hit_by_price:
-            archive_position(pos, "TP_HIT", live_price, pnl_pct)
-            continue
+            if side == "LONG":
+                if live_price <= safe_float(pos["sl"]):
+                    close_reason = "SL_HIT"
+                elif live_price >= tp:
+                    close_reason = "TP_HIT"
+            else:
+                if live_price >= safe_float(pos["sl"]):
+                    close_reason = "SL_HIT"
+                elif live_price <= tp:
+                    close_reason = "TP_HIT"
 
-        if sl_hit_by_price:
-            archive_position(pos, "SL_HIT", live_price, pnl_pct)
-            continue
+            if close_reason:
+                pos["status"] = "CLOSED"
+                closed_row = dict(pos)
+                closed_row["closed_at"] = utc_now_str()
+                closed_row["close_reason"] = close_reason
+                closed_row["close_price"] = round(live_price, 8)
+                closed.append(closed_row)
 
-        alive.append(pos)
+                log_message(
+                    f"POSITION_CLOSED {pos['symbol']} reason={close_reason} net_pnl_pct={pos['net_pnl_pct']}",
+                    CONFIG.FILES.POSITION_LOG_FILE,
+                )
+                alert_position_closed(pos, close_reason)
+            else:
+                updated_positions.append(pos)
 
-    save_open_positions(alive)
+        except Exception as e:
+            log_message(
+                f"POSITION_UPDATE_FAIL {pos.get('symbol')} error={e}",
+                CONFIG.FILES.POSITION_LOG_FILE,
+            )
+            updated_positions.append(pos)
+
+    save_open_positions(updated_positions)
+    save_closed_positions(closed)
+
+
+def notify_live_positions() -> None:
+    positions = load_open_positions()
+    for pos in positions:
+        try:
+            alert_position_update(pos)
+        except Exception:
+            pass
 
 
 def run_position_loop() -> None:
     log_message(
         f"===== POSITION LOOP START mode={CONFIG.ENGINE.EXECUTION_MODE} =====",
-        POSITION_LOG_FILE,
+        CONFIG.FILES.POSITION_LOG_FILE,
     )
 
     while True:
         try:
-            reconcile_armed_orders()
+            process_orders_into_positions()
         except Exception as e:
-            log_message(f"RECONCILE_ARMED_ERROR error={e}", POSITION_LOG_FILE)
+            log_message(f"PROCESS_ORDERS_ERROR error={e}", CONFIG.FILES.POSITION_LOG_FILE)
 
         try:
             update_positions()
         except Exception as e:
-            log_message(f"POSITION_LOOP_ERROR error={e}", POSITION_LOG_FILE)
+            log_message(f"POSITION_LOOP_ERROR error={e}", CONFIG.FILES.POSITION_LOG_FILE)
 
-        time.sleep(2)
+        time.sleep(CONFIG.TRADE.POSITION_LOOP_SECONDS)
 
 
 if __name__ == "__main__":
-    reconcile_armed_orders()
-    update_positions()
+    run_position_loop()
