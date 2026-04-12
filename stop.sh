@@ -1,48 +1,64 @@
 #!/bin/bash
 
-set -u
+set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$BASE_DIR" || exit 1
 
-PID_FILE=".run_pid"
-POS_PID_FILE=".position.pid"
+PID_DIR="$BASE_DIR/pids"
+ORDER_PID_FILE="$PID_DIR/order.pid"
+POSITION_PID_FILE="$PID_DIR/position.pid"
 
-echo "🛑 Stopping unified trading engine..."
+mkdir -p "$PID_DIR"
 
-if [ -f "$POS_PID_FILE" ]; then
-  POS_PID=$(cat "$POS_PID_FILE" 2>/dev/null || true)
-  if [ -n "${POS_PID:-}" ] && ps -p "$POS_PID" > /dev/null 2>&1; then
-    echo "Stopping position supervisor PID: $POS_PID"
-    kill -TERM "$POS_PID" 2>/dev/null || true
-    sleep 1
-    ps -p "$POS_PID" > /dev/null 2>&1 && kill -KILL "$POS_PID" 2>/dev/null || true
+is_running() {
+  local pid="${1:-}"
+  if [ -z "$pid" ]; then
+    return 1
   fi
-  rm -f "$POS_PID_FILE"
-fi
+  ps -p "$pid" > /dev/null 2>&1
+}
 
-if [ -f "$PID_FILE" ]; then
-  MAIN_PID=$(cat "$PID_FILE" 2>/dev/null || true)
-  if [ -n "${MAIN_PID:-}" ] && ps -p "$MAIN_PID" > /dev/null 2>&1; then
-    echo "Stopping main run.sh PID: $MAIN_PID"
-    kill -TERM "$MAIN_PID" 2>/dev/null || true
-    sleep 1
-    ps -p "$MAIN_PID" > /dev/null 2>&1 && kill -KILL "$MAIN_PID" 2>/dev/null || true
+stop_by_pid_file() {
+  local pid_file="$1"
+  local label="$2"
+
+  if [ ! -f "$pid_file" ]; then
+    echo "$label PID file not found"
+    return 0
   fi
-  rm -f "$PID_FILE"
-fi
 
-# safety sweep
-pkill -TERM -f "position.py" 2>/dev/null || true
-pkill -TERM -f "order.py" 2>/dev/null || true
-pkill -TERM -f "run.sh" 2>/dev/null || true
-sleep 1
-pkill -KILL -f "position.py" 2>/dev/null || true
-pkill -KILL -f "order.py" 2>/dev/null || true
-pkill -KILL -f "run.sh" 2>/dev/null || true
-pkill -KILL -f "position_ws.py" 2>/dev/null || true
-echo
-echo "Remaining related processes:"
-pgrep -af "position.py|order.py|run.sh" || echo "No related processes found ✅"
+  local pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
 
-echo "✅ Unified trading engine stopped."
+  if is_running "${pid:-}"; then
+    echo "Stopping $label (PID $pid)"
+    kill "$pid" 2>/dev/null || true
+    sleep 2
+
+    if is_running "$pid"; then
+      echo "Force killing $label (PID $pid)"
+      kill -9 "$pid" 2>/dev/null || true
+      sleep 1
+    fi
+
+    if is_running "$pid"; then
+      echo "Failed to stop $label (PID $pid)"
+      exit 1
+    else
+      echo "$label stopped"
+    fi
+  else
+    echo "$label not running, cleaning stale PID file"
+  fi
+
+  rm -f "$pid_file"
+}
+
+echo "========== TRADING ENGINE STOP =========="
+
+stop_by_pid_file "$ORDER_PID_FILE" "order.py"
+stop_by_pid_file "$POSITION_PID_FILE" "position.py"
+
+echo "All tracked engine processes stopped."
+echo "========================================"
