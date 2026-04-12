@@ -1,13 +1,10 @@
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from binance_real import BinanceFuturesClient
 from config import CONFIG
 from telegram_alert import alert_position_closed, alert_position_opened, alert_position_update
 from market import get_symbol_meta, get_market_snapshot
 from utils import (
-    compute_rr,
-    expected_net_pnl_pct,
     log_message,
     new_position_id,
     order_fieldnames,
@@ -22,12 +19,21 @@ from utils import (
     write_csv,
 )
 
-client = BinanceFuturesClient()
+
+def get_binance_client():
+    """
+    Binance client sadece REAL modda gerektiğinde oluşturulur.
+    PAPER modda authenticated Binance çağrısı yapılmamalı.
+    """
+    if CONFIG.ENGINE.EXECUTION_MODE != "REAL":
+        return None
+
+    from binance_real import BinanceFuturesClient
+    return BinanceFuturesClient()
 
 
 def load_open_orders() -> List[Dict[str, Any]]:
-    rows = read_csv(CONFIG.FILES.OPEN_ORDERS_CSV)
-    return rows
+    return read_csv(CONFIG.FILES.OPEN_ORDERS_CSV)
 
 
 def save_open_orders(rows: List[Dict[str, Any]]) -> None:
@@ -35,8 +41,7 @@ def save_open_orders(rows: List[Dict[str, Any]]) -> None:
 
 
 def load_open_positions() -> List[Dict[str, Any]]:
-    rows = read_csv(CONFIG.FILES.OPEN_POSITIONS_CSV)
-    return rows
+    return read_csv(CONFIG.FILES.OPEN_POSITIONS_CSV)
 
 
 def save_open_positions(rows: List[Dict[str, Any]]) -> None:
@@ -48,7 +53,11 @@ def load_closed_positions() -> List[Dict[str, Any]]:
 
 
 def save_closed_positions(rows: List[Dict[str, Any]]) -> None:
-    write_csv(CONFIG.FILES.CLOSED_POSITIONS_CSV, rows, position_fieldnames() + ["closed_at", "close_reason", "close_price"])
+    write_csv(
+        CONFIG.FILES.CLOSED_POSITIONS_CSV,
+        rows,
+        position_fieldnames() + ["closed_at", "close_reason", "close_price"],
+    )
 
 
 def calc_qty(symbol: str, entry: float, symbol_meta: Dict[str, Any]) -> float:
@@ -68,7 +77,14 @@ def close_side_to_binance(side: str) -> str:
     return "SELL" if side.upper() == "LONG" else "BUY"
 
 
-def arm_protection(symbol: str, side: str, qty: float, sl: float, tp: float) -> Dict[str, Any]:
+def arm_protection(
+    client: Any,
+    symbol: str,
+    side: str,
+    qty: float,
+    sl: float,
+    tp: float,
+) -> Dict[str, Any]:
     sl_side = close_side_to_binance(side)
     tp_side = close_side_to_binance(side)
 
@@ -93,13 +109,23 @@ def arm_protection(symbol: str, side: str, qty: float, sl: float, tp: float) -> 
     }
 
 
-def open_position_from_order(order: Dict[str, Any], live_price: float, symbol_meta: Dict[str, Any]) -> Dict[str, Any]:
+def open_position_from_order(
+    order: Dict[str, Any],
+    live_price: float,
+    symbol_meta: Dict[str, Any],
+) -> Dict[str, Any]:
     entry = safe_float(order["entry_trigger"])
     qty = calc_qty(order["symbol"], entry, symbol_meta)
 
-    client.set_leverage(order["symbol"], CONFIG.TRADE.LEVERAGE)
+    protection = {"sl_order_id": "", "tp_order_id": ""}
 
     if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
+        client = get_binance_client()
+        if client is None:
+            raise RuntimeError("REAL mode active but Binance client could not be created")
+
+        client.set_leverage(order["symbol"], CONFIG.TRADE.LEVERAGE)
+
         if CONFIG.TRADE.USE_LIMIT_ENTRY:
             price = round_tick(entry, symbol_meta["price_tick"])
             client.place_limit_order(
@@ -117,14 +143,18 @@ def open_position_from_order(order: Dict[str, Any], live_price: float, symbol_me
                 reduce_only=False,
             )
 
-    protection = {"sl_order_id": "", "tp_order_id": ""}
-    if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
         protection = arm_protection(
+            client=client,
             symbol=order["symbol"],
             side=order["side"],
             qty=qty,
             sl=round_tick(safe_float(order["sl"]), symbol_meta["price_tick"]),
             tp=round_tick(safe_float(order["tp"]), symbol_meta["price_tick"]),
+        )
+    else:
+        log_message(
+            f"PAPER ORDER_TO_POSITION {order['symbol']} {order['side']} entry={entry}",
+            CONFIG.FILES.POSITION_LOG_FILE,
         )
 
     now = utc_now_str()
@@ -165,11 +195,16 @@ def process_orders_into_positions() -> None:
     positions = load_open_positions()
     symbol_meta_all = get_symbol_meta()
 
-    active_symbols = {p["symbol"] for p in positions if p.get("status") == "OPEN_POSITION"}
+    active_symbols = {
+        p["symbol"]
+        for p in positions
+        if p.get("status") == "OPEN_POSITION"
+    }
 
     for order in orders:
         if order.get("status") != "OPEN_ORDER":
             continue
+
         if order["symbol"] in active_symbols:
             continue
 
@@ -181,37 +216,46 @@ def process_orders_into_positions() -> None:
 
             zone_low = safe_float(order["entry_zone_low"])
             zone_high = safe_float(order["entry_zone_high"])
+            side = str(order["side"]).upper()
 
-            if price_in_zone(live_price, zone_low, zone_high):
+            if price_in_zone(live_price, side, zone_low, zone_high):
                 order["zone_touched"] = 1
 
-            if not price_in_zone(live_price, zone_low, zone_high):
+            if not price_in_zone(live_price, side, zone_low, zone_high):
                 continue
 
             entry = safe_float(order["entry_trigger"])
-            if order["side"] == "LONG" and live_price > entry * 1.003:
+            if side == "LONG" and live_price > entry * 1.003:
                 continue
-            if order["side"] == "SHORT" and live_price < entry * 0.997:
+            if side == "SHORT" and live_price < entry * 0.997:
                 continue
 
             symbol_meta = symbol_meta_all.get(order["symbol"])
             if not symbol_meta:
+                log_message(
+                    f"SYMBOL_META_MISSING {order['symbol']}",
+                    CONFIG.FILES.POSITION_LOG_FILE,
+                )
                 continue
 
             pos = open_position_from_order(order, live_price, symbol_meta)
             positions.append(pos)
 
             order["status"] = "FILLED_TO_POSITION"
+            order["updated_at"] = utc_now_str()
+
             alert_position_opened(pos)
 
             log_message(
-                f"ORDER_TO_POSITION {order['symbol']} {order['side']} entry={pos['entry']} qty={pos['qty']}",
+                f"ORDER_TO_POSITION {order['symbol']} {order['side']} "
+                f"entry={pos['entry']} qty={pos['qty']} mode={CONFIG.ENGINE.EXECUTION_MODE}",
                 CONFIG.FILES.POSITION_LOG_FILE,
             )
 
         except Exception as e:
             log_message(
-                f"ORDER_TO_POSITION_FAIL {order.get('symbol')} error={e}",
+                f"ORDER_TO_POSITION_FAIL {order.get('symbol')} "
+                f"mode={CONFIG.ENGINE.EXECUTION_MODE} error={e}",
                 CONFIG.FILES.POSITION_LOG_FILE,
             )
 
@@ -233,12 +277,16 @@ def update_positions() -> None:
             live_price = safe_float(market["price"])
             entry = safe_float(pos["entry"])
             qty = safe_float(pos["qty"])
-            side = pos["side"]
+            side = str(pos["side"]).upper()
             sl = safe_float(pos["sl"])
             tp = safe_float(pos["tp"])
 
             gross_pct = pct_change(entry, live_price, side)
-            fees_pct = CONFIG.TRADE.MAKER_FEE_PCT + CONFIG.TRADE.TAKER_FEE_PCT + CONFIG.TRADE.ROUND_TRIP_SLIPPAGE_PCT
+            fees_pct = (
+                CONFIG.TRADE.MAKER_FEE_PCT
+                + CONFIG.TRADE.TAKER_FEE_PCT
+                + CONFIG.TRADE.ROUND_TRIP_SLIPPAGE_PCT
+            )
             net_pct = gross_pct - fees_pct
             notional = entry * qty
             net_usdt = (net_pct / 100.0) * notional
@@ -259,7 +307,6 @@ def update_positions() -> None:
             one_r = risk if risk > 0 else 0.0
             progress_r = abs(live_price - entry) / one_r if one_r > 0 else 0.0
 
-            # Break-even logic
             if CONFIG.TRADE.ENABLE_TRAILING and not int(float(pos.get("break_even_armed", 0))):
                 if progress_r >= CONFIG.TRADE.BREAK_EVEN_TRIGGER_R:
                     pos["sl"] = round(entry, 8)
@@ -269,7 +316,6 @@ def update_positions() -> None:
                         CONFIG.FILES.POSITION_LOG_FILE,
                     )
 
-            # Trailing logic
             if CONFIG.TRADE.ENABLE_TRAILING and progress_r >= CONFIG.TRADE.TRAIL_AFTER_R:
                 if side == "LONG":
                     trail_sl = live_price - (one_r * 0.80)
@@ -280,7 +326,7 @@ def update_positions() -> None:
                     if trail_sl < safe_float(pos["sl"]):
                         pos["sl"] = round(trail_sl, 8)
 
-            close_reason = None
+            close_reason: Optional[str] = None
 
             if side == "LONG":
                 if live_price <= safe_float(pos["sl"]):
@@ -295,6 +341,7 @@ def update_positions() -> None:
 
             if close_reason:
                 pos["status"] = "CLOSED"
+
                 closed_row = dict(pos)
                 closed_row["closed_at"] = utc_now_str()
                 closed_row["close_reason"] = close_reason
@@ -302,7 +349,8 @@ def update_positions() -> None:
                 closed.append(closed_row)
 
                 log_message(
-                    f"POSITION_CLOSED {pos['symbol']} reason={close_reason} net_pnl_pct={pos['net_pnl_pct']}",
+                    f"POSITION_CLOSED {pos['symbol']} reason={close_reason} "
+                    f"net_pnl_pct={pos['net_pnl_pct']}",
                     CONFIG.FILES.POSITION_LOG_FILE,
                 )
                 alert_position_closed(pos, close_reason)
@@ -339,12 +387,18 @@ def run_position_loop() -> None:
         try:
             process_orders_into_positions()
         except Exception as e:
-            log_message(f"PROCESS_ORDERS_ERROR error={e}", CONFIG.FILES.POSITION_LOG_FILE)
+            log_message(
+                f"PROCESS_ORDERS_ERROR mode={CONFIG.ENGINE.EXECUTION_MODE} error={e}",
+                CONFIG.FILES.POSITION_LOG_FILE,
+            )
 
         try:
             update_positions()
         except Exception as e:
-            log_message(f"POSITION_LOOP_ERROR error={e}", CONFIG.FILES.POSITION_LOG_FILE)
+            log_message(
+                f"POSITION_LOOP_ERROR mode={CONFIG.ENGINE.EXECUTION_MODE} error={e}",
+                CONFIG.FILES.POSITION_LOG_FILE,
+            )
 
         time.sleep(CONFIG.TRADE.POSITION_LOOP_SECONDS)
 
