@@ -216,7 +216,7 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
     # Trend-following breakouts
     if t1 == "LONG" and t4 == "LONG" and tD == "LONG" and last > recent_high * 0.998:
         entry = last
-        sl = entry - (current_atr * 1.10)
+        sl = entry - (current_atr * CONFIG.TRADE.SL_MULTIPLIER)
         tp = entry + (current_atr * 2.90)
         side = "LONG"
         setup_type = "BREAKOUT"
@@ -224,7 +224,7 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
 
     elif t1 == "SHORT" and t4 == "SHORT" and tD == "SHORT" and last < recent_low * 1.002:
         entry = last
-        sl = entry + (current_atr * 1.10)
+        sl = entry + (current_atr * CONFIG.TRADE.SL_MULTIPLIER)
         tp = entry - (current_atr * 2.90)
         side = "SHORT"
         setup_type = "BREAKOUT"
@@ -233,7 +233,7 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
     # Trend pullbacks
     elif t4 == "LONG" and tD == "LONG" and last > ema50 and prev >= ema20 * 0.995 and last >= ema20:
         entry = ema20
-        sl = entry - (current_atr * 1.00)
+        sl = entry - (current_atr * CONFIG.TRADE.SL_MULTIPLIER)
         tp = entry + (current_atr * 2.70)
         side = "LONG"
         setup_type = "PULLBACK"
@@ -241,7 +241,7 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
 
     elif t4 == "SHORT" and tD == "SHORT" and last < ema50 and prev <= ema20 * 1.005 and last <= ema20:
         entry = ema20
-        sl = entry + (current_atr * 1.00)
+        sl = entry + (current_atr * CONFIG.TRADE.SL_MULTIPLIER)
         tp = entry - (current_atr * 2.70)
         side = "SHORT"
         setup_type = "PULLBACK"
@@ -251,7 +251,7 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
     elif tD == "RANGE" and CONFIG.TRADE.ALLOW_RANGE_PULLBACKS:
         if t4 == "LONG" and last > ema50 and prev >= ema20 * 0.996 and last >= ema20:
             entry = ema20
-            sl = entry - (current_atr * 0.95)
+            sl = entry - (current_atr * CONFIG.TRADE.SL_MULTIPLIER)
             tp = entry + (current_atr * 2.20)
             side = "LONG"
             setup_type = "PULLBACK"
@@ -259,7 +259,7 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
 
         elif t4 == "SHORT" and last < ema50 and prev <= ema20 * 1.004 and last <= ema20:
             entry = ema20
-            sl = entry + (current_atr * 0.95)
+            sl = entry + (current_atr * CONFIG.TRADE.SL_MULTIPLIER)
             tp = entry - (current_atr * 2.20)
             side = "SHORT"
             setup_type = "PULLBACK"
@@ -269,7 +269,7 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
     if not side and tD == "RANGE" and CONFIG.TRADE.ALLOW_RANGE_BREAKOUTS:
         if t1 == "LONG" and t4 == "LONG" and last > recent_high * 0.999:
             entry = last
-            sl = entry - (current_atr * 1.05)
+            sl = entry - (current_atr * CONFIG.TRADE.SL_MULTIPLIER)
             tp = entry + (current_atr * 2.30)
             side = "LONG"
             setup_type = "BREAKOUT"
@@ -277,7 +277,7 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
 
         elif t1 == "SHORT" and t4 == "SHORT" and last < recent_low * 1.001:
             entry = last
-            sl = entry + (current_atr * 1.05)
+            sl = entry + (current_atr * CONFIG.TRADE.SL_MULTIPLIER)
             tp = entry - (current_atr * 2.30)
             side = "SHORT"
             setup_type = "BREAKOUT"

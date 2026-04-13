@@ -35,6 +35,44 @@ def send_telegram_message(text: str) -> bool:
         return False
 
 
+def alert_break_even(pos: dict) -> None:
+    text = (
+        f"🟦 <b>BREAK EVEN ARMED</b>\n"
+        f"<b>{pos['symbol']}</b> {pos['side']}\n"
+        f"Entry: {pos['entry']}\n"
+        f"Live: {pos['live_price']}\n"
+        f"New SL: {pos['sl']}\n"
+        f"Qty: {pos['qty']}"
+    )
+    send_telegram_message(text)
+
+
+def alert_partial_tp(pos: dict, closed_qty: float, progress_r: float) -> None:
+    text = (
+        f"🟨 <b>PARTIAL TP HIT</b>\n"
+        f"<b>{pos['symbol']}</b> {pos['side']}\n"
+        f"Entry: {pos['entry']}\n"
+        f"Live: {pos['live_price']}\n"
+        f"Closed Qty: {round(closed_qty, 8)}\n"
+        f"Remaining Qty: {pos['qty']}\n"
+        f"Progress: {round(progress_r, 2)}R"
+    )
+    send_telegram_message(text)
+
+
+def alert_trailing_update(pos: dict, old_sl: float, new_sl: float, progress_r: float) -> None:
+    text = (
+        f"🟪 <b>TRAILING SL UPDATED</b>\n"
+        f"<b>{pos['symbol']}</b> {pos['side']}\n"
+        f"Entry: {pos['entry']}\n"
+        f"Live: {pos['live_price']}\n"
+        f"Old SL: {round(old_sl, 8)}\n"
+        f"New SL: {round(new_sl, 8)}\n"
+        f"Progress: {round(progress_r, 2)}R"
+    )
+    send_telegram_message(text)
+
+
 def alert_new_order(order: dict) -> None:
     text = (
         f"🟡 <b>NEW ORDER</b>\n"

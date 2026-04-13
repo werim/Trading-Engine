@@ -1,4 +1,5 @@
 from dotenv import load_dotenv
+
 load_dotenv()
 
 from dataclasses import dataclass, field
@@ -7,7 +8,7 @@ import os
 
 @dataclass
 class EngineConfig:
-    EXECUTION_MODE: str = os.getenv("EXECUTION_MODE", "REAL").upper()  # PAPER | REAL
+    EXECUTION_MODE: str = os.getenv("EXECUTION_MODE", "PAPER").upper()  # PAPER | REAL
     BASE_DIR: str = os.getenv("BASE_DIR", ".")
     DATA_DIR: str = os.getenv("DATA_DIR", "data")
     LOG_DIR: str = os.getenv("LOG_DIR", "logs")
@@ -27,6 +28,8 @@ class TradeConfig:
     # Universe
     QUOTE_ASSET: str = "USDT"
     MAX_SYMBOLS: int = int(os.getenv("MAX_SYMBOLS", "60"))
+    SL_MULTIPLIER: float = float(os.getenv("SL_MULTIPLIER", "1.0"))
+    TRAIL_FACTOR: float = float(os.getenv("TRAIL_FACTOR", "1.0"))
 
     # Timeframes
     HTF_INTERVAL: str = os.getenv("HTF_INTERVAL", "1d")

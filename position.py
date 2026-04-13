@@ -1,8 +1,16 @@
+# -*- coding: utf-8 -*-
 import time
 from typing import Any, Dict, List, Optional
 
 from config import CONFIG
-from telegram_alert import alert_position_closed, alert_position_opened, alert_position_update
+from telegram_alert import (
+    alert_break_even,
+    alert_partial_tp,
+    alert_position_closed,
+    alert_position_opened,
+    alert_position_update,
+    alert_trailing_update,
+)
 from market import get_symbol_meta, get_market_snapshot
 from utils import (
     log_message,
@@ -109,6 +117,106 @@ def arm_protection(
     }
 
 
+def cancel_existing_protection_if_any(pos: Dict[str, Any]) -> None:
+    """
+    REAL modda qty değişince eski SL/TP korumalarını iptal edip yeniden kurmak gerekir.
+    """
+    if CONFIG.ENGINE.EXECUTION_MODE != "REAL":
+        return
+
+    client = get_binance_client()
+    if client is None:
+        return
+
+    symbol = pos["symbol"]
+    sl_order_id = str(pos.get("sl_order_id", "")).strip()
+    tp_order_id = str(pos.get("tp_order_id", "")).strip()
+
+    try:
+        if sl_order_id and sl_order_id != "paper-sl":
+            client.cancel_order(symbol=symbol, order_id=int(sl_order_id))
+    except Exception as e:
+        log_message(
+            f"CANCEL_SL_PROTECTION_FAIL {symbol} sl_order_id={sl_order_id} error={e}",
+            CONFIG.FILES.POSITION_LOG_FILE,
+        )
+
+    try:
+        if tp_order_id and tp_order_id != "paper-tp":
+            client.cancel_order(symbol=symbol, order_id=int(tp_order_id))
+    except Exception as e:
+        log_message(
+            f"CANCEL_TP_PROTECTION_FAIL {symbol} tp_order_id={tp_order_id} error={e}",
+            CONFIG.FILES.POSITION_LOG_FILE,
+        )
+
+
+def rearm_protection_for_position(pos: Dict[str, Any], symbol_meta: Dict[str, Any]) -> None:
+    """
+    Kalan qty ile korumaları yeniden kur.
+    """
+    if CONFIG.ENGINE.EXECUTION_MODE != "REAL":
+        pos["sl_order_id"] = "paper-sl"
+        pos["tp_order_id"] = "paper-tp"
+        pos["protection_armed"] = 1
+        return
+
+    client = get_binance_client()
+    if client is None:
+        raise RuntimeError("REAL mode active but Binance client could not be created")
+
+    protection = arm_protection(
+        client=client,
+        symbol=pos["symbol"],
+        side=pos["side"],
+        qty=safe_float(pos["qty"]),
+        sl=round_tick(safe_float(pos["sl"]), symbol_meta["price_tick"]),
+        tp=round_tick(safe_float(pos["tp"]), symbol_meta["price_tick"]),
+    )
+
+    pos["sl_order_id"] = protection["sl_order_id"]
+    pos["tp_order_id"] = protection["tp_order_id"]
+    pos["protection_armed"] = 1 if protection["sl_order_id"] or protection["tp_order_id"] else 0
+
+
+def execute_partial_close(pos: Dict[str, Any], close_ratio: float, symbol_meta: Dict[str, Any]) -> float:
+    """
+    Pozisyonun bir kısmını kapatır.
+    Dönüş değeri: kapatılan qty
+    """
+    current_qty = safe_float(pos["qty"])
+    if current_qty <= 0:
+        return 0.0
+
+    close_ratio = max(0.0, min(close_ratio, 1.0))
+    raw_close_qty = current_qty * close_ratio
+    close_qty = round_step(raw_close_qty, symbol_meta["qty_step"])
+
+    if close_qty <= 0:
+        return 0.0
+
+    # Kalan qty min qty altına düşüyorsa tamamını kapatmaya çalışma, partial atla
+    remaining_qty = round_step(current_qty - close_qty, symbol_meta["qty_step"])
+    if remaining_qty < symbol_meta["min_qty"]:
+        return 0.0
+
+    if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
+        client = get_binance_client()
+        if client is None:
+            raise RuntimeError("REAL mode active but Binance client could not be created")
+
+        client.place_market_order(
+            symbol=pos["symbol"],
+            side=close_side_to_binance(pos["side"]),
+            quantity=close_qty,
+            reduce_only=True,
+        )
+
+    pos["qty"] = round(remaining_qty, 8)
+    pos["updated_at"] = utc_now_str()
+    return close_qty
+
+
 def open_position_from_order(
     order: Dict[str, Any],
     live_price: float,
@@ -152,6 +260,7 @@ def open_position_from_order(
             tp=round_tick(safe_float(order["tp"]), symbol_meta["price_tick"]),
         )
     else:
+        protection = {"sl_order_id": "paper-sl", "tp_order_id": "paper-tp"}
         log_message(
             f"PAPER ORDER_TO_POSITION {order['symbol']} {order['side']} entry={entry}",
             CONFIG.FILES.POSITION_LOG_FILE,
@@ -187,6 +296,8 @@ def open_position_from_order(
         "break_even_armed": 0,
         "highest_price": round(live_price, 8),
         "lowest_price": round(live_price, 8),
+        "initial_qty": round(qty, 8),
+        "initial_risk": round(abs(entry - safe_float(order["sl"])), 8),
     }
 
 
@@ -218,10 +329,10 @@ def process_orders_into_positions() -> None:
             zone_high = safe_float(order["entry_zone_high"])
             side = str(order["side"]).upper()
 
-            if price_in_zone(live_price, side, zone_low, zone_high):
+            if price_in_zone(live_price, zone_low, zone_high):
                 order["zone_touched"] = 1
 
-            if not price_in_zone(live_price, side, zone_low, zone_high):
+            if not price_in_zone(live_price, zone_low, zone_high):
                 continue
 
             entry = safe_float(order["entry_trigger"])
@@ -253,11 +364,20 @@ def process_orders_into_positions() -> None:
             )
 
         except Exception as e:
+            err = str(e)
             log_message(
                 f"ORDER_TO_POSITION_FAIL {order.get('symbol')} "
-                f"mode={CONFIG.ENGINE.EXECUTION_MODE} error={e}",
+                f"mode={CONFIG.ENGINE.EXECUTION_MODE} error={err}",
                 CONFIG.FILES.POSITION_LOG_FILE,
             )
+
+            if "-2015" in err or "Invalid API-key, IP, or permissions" in err:
+                order["status"] = "AUTH_FAILED"
+                order["updated_at"] = utc_now_str()
+                log_message(
+                    f"ORDER_BLOCKED_AUTH {order.get('symbol')} order_id={order.get('order_id')}",
+                    CONFIG.FILES.POSITION_LOG_FILE,
+                )
 
     save_open_orders(orders)
     save_open_positions(positions)
@@ -267,6 +387,7 @@ def update_positions() -> None:
     positions = load_open_positions()
     closed = load_closed_positions()
     updated_positions: List[Dict[str, Any]] = []
+    symbol_meta_all = get_symbol_meta()
 
     for pos in positions:
         if pos.get("status") != "OPEN_POSITION":
@@ -280,6 +401,10 @@ def update_positions() -> None:
             side = str(pos["side"]).upper()
             sl = safe_float(pos["sl"])
             tp = safe_float(pos["tp"])
+            initial_risk = safe_float(pos.get("initial_risk"))
+
+            if initial_risk <= 0:
+                initial_risk = abs(entry - sl)
 
             gross_pct = pct_change(entry, live_price, side)
             fees_pct = (
@@ -303,10 +428,9 @@ def update_positions() -> None:
             old_lowest = safe_float(pos.get("lowest_price"))
             pos["lowest_price"] = live_price if old_lowest == 0 else min(old_lowest, live_price)
 
-            risk = abs(entry - sl)
-            one_r = risk if risk > 0 else 0.0
-            progress_r = abs(live_price - entry) / one_r if one_r > 0 else 0.0
+            progress_r = abs(live_price - entry) / initial_risk if initial_risk > 0 else 0.0
 
+            # 1) BREAK EVEN
             if CONFIG.TRADE.ENABLE_TRAILING and not int(float(pos.get("break_even_armed", 0))):
                 if progress_r >= CONFIG.TRADE.BREAK_EVEN_TRIGGER_R:
                     pos["sl"] = round(entry, 8)
@@ -315,17 +439,70 @@ def update_positions() -> None:
                         f"BREAK_EVEN_ARMED {pos['symbol']} side={side} entry={entry}",
                         CONFIG.FILES.POSITION_LOG_FILE,
                     )
+                    alert_break_even(pos)
 
+                    if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
+                        symbol_meta = symbol_meta_all.get(pos["symbol"])
+                        if symbol_meta:
+                            cancel_existing_protection_if_any(pos)
+                            rearm_protection_for_position(pos, symbol_meta)
+
+            # 2) PARTIAL TP
+            partial_taken = int(float(pos.get("partial_taken", 0)))
+            if partial_taken == 0 and CONFIG.TRADE.PARTIAL_TP_AT_R < 99:
+                if progress_r >= CONFIG.TRADE.PARTIAL_TP_AT_R:
+                    symbol_meta = symbol_meta_all.get(pos["symbol"])
+                    if symbol_meta:
+                        closed_qty = execute_partial_close(
+                            pos=pos,
+                            close_ratio=CONFIG.TRADE.PARTIAL_CLOSE_RATIO,
+                            symbol_meta=symbol_meta,
+                        )
+
+                        if closed_qty > 0:
+                            pos["partial_taken"] = 1
+
+                            log_message(
+                                f"PARTIAL_TP_HIT {pos['symbol']} side={side} "
+                                f"closed_qty={round(closed_qty, 8)} remaining_qty={pos['qty']} "
+                                f"progress_r={round(progress_r, 4)} mode={CONFIG.ENGINE.EXECUTION_MODE}",
+                                CONFIG.FILES.POSITION_LOG_FILE,
+                            )
+                            alert_partial_tp(pos, closed_qty, progress_r)
+
+
+                            if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
+                                cancel_existing_protection_if_any(pos)
+                                rearm_protection_for_position(pos, symbol_meta)
+
+            # 3) TRAILING
             if CONFIG.TRADE.ENABLE_TRAILING and progress_r >= CONFIG.TRADE.TRAIL_AFTER_R:
+                old_sl = safe_float(pos["sl"])
+
                 if side == "LONG":
-                    trail_sl = live_price - (one_r * 0.80)
-                    if trail_sl > safe_float(pos["sl"]):
+                    trail_sl = live_price - (initial_risk * CONFIG.TRADE.TRAIL_FACTOR)
+                    if trail_sl > old_sl:
                         pos["sl"] = round(trail_sl, 8)
                 else:
-                    trail_sl = live_price + (one_r * 0.80)
-                    if trail_sl < safe_float(pos["sl"]):
+                    trail_sl = live_price + (initial_risk * CONFIG.TRADE.TRAIL_FACTOR)
+                    if trail_sl < old_sl:
                         pos["sl"] = round(trail_sl, 8)
 
+                if safe_float(pos["sl"]) != old_sl:
+                    log_message(
+                        f"TRAIL_SL_UPDATE {pos['symbol']} side={side} old_sl={round(old_sl, 8)} "
+                        f"new_sl={pos['sl']} progress_r={round(progress_r, 4)}",
+                        CONFIG.FILES.POSITION_LOG_FILE,
+                    )
+                    alert_trailing_update(pos, old_sl, safe_float(pos["sl"]), progress_r)
+
+                    if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
+                        symbol_meta = symbol_meta_all.get(pos["symbol"])
+                        if symbol_meta:
+                            cancel_existing_protection_if_any(pos)
+                            rearm_protection_for_position(pos, symbol_meta)
+
+            # 4) EXIT
             close_reason: Optional[str] = None
 
             if side == "LONG":
@@ -350,7 +527,7 @@ def update_positions() -> None:
 
                 log_message(
                     f"POSITION_CLOSED {pos['symbol']} reason={close_reason} "
-                    f"net_pnl_pct={pos['net_pnl_pct']}",
+                    f"net_pnl_pct={pos['net_pnl_pct']} mode={CONFIG.ENGINE.EXECUTION_MODE}",
                     CONFIG.FILES.POSITION_LOG_FILE,
                 )
                 alert_position_closed(pos, close_reason)

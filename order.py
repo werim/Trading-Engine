@@ -36,38 +36,43 @@ def candidate_to_order(setup: Dict[str, Any], live_price: float) -> Dict[str, An
         "order_id": new_order_id(setup["symbol"], setup["side"]),
         "symbol": setup["symbol"],
         "side": setup["side"],
-        "entry_zone_low": round(setup["entry_zone_low"], 8),
-        "entry_zone_high": round(setup["entry_zone_high"], 8),
-        "entry_trigger": round(setup["entry_trigger"], 8),
-        "sl": round(setup["sl"], 8),
-        "tp": round(setup["tp"], 8),
-        "rr": setup["rr"],
-        "score": setup["score"],
-        "tf_context": setup["tf_context"],
-        "setup_type": setup["setup_type"],
-        "setup_reason": setup["setup_reason"],
+        "entry_zone_low": round(safe_float(setup.get("entry_zone_low", 0)), 8),
+        "entry_zone_high": round(safe_float(setup.get("entry_zone_high", 0)), 8),
+        "entry_trigger": round(safe_float(setup.get("entry_trigger", 0)), 8),
+        "sl": round(safe_float(setup.get("sl", 0)), 8),
+        "tp": round(safe_float(setup.get("tp", 0)), 8),
+        "rr": safe_float(setup.get("rr", 0)),
+        "score": int(safe_float(setup.get("score", 0))),
+        "tf_context": setup.get("tf_context", ""),
+        "setup_type": setup.get("setup_type", ""),
+        "setup_reason": setup.get("setup_reason", ""),
         "created_at": now,
         "updated_at": now,
         "expires_at": "",
         "status": "OPEN_ORDER",
-        "live_price": round(live_price, 8),
+        "live_price": round(safe_float(live_price), 8),
         "zone_touched": 0,
         "alarm_touched_sent": 0,
         "alarm_near_trigger_sent": 0,
         "last_alarm_at": "",
-        "expected_net_pnl_pct": setup["expected_net_pnl_pct"],
-        "stop_net_loss_pct": setup["stop_net_loss_pct"],
-        "volume_24h_usdt": "",
-        "spread_pct": setup["spread_pct"],
-        "funding_rate_pct": setup["funding_rate_pct"],
+        "expected_net_pnl_pct": safe_float(setup.get("expected_net_pnl_pct", 0)),
+        "stop_net_loss_pct": safe_float(setup.get("stop_net_loss_pct", 0)),
+        "volume_24h_usdt": safe_float(setup.get("volume_24h_usdt", 0)),
+        "spread_pct": safe_float(setup.get("spread_pct", 0)),
+        "funding_rate_pct": safe_float(setup.get("funding_rate_pct", 0)),
     }
 
 
 def dedupe_orders(existing: List[Dict[str, Any]], new_orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    existing_keys = {(r["symbol"], r["side"], r["setup_type"]) for r in existing if r.get("status") == "OPEN_ORDER"}
+    existing_keys = {
+        (r.get("symbol"), r.get("side"), r.get("setup_type"))
+        for r in existing
+        if r.get("status") == "OPEN_ORDER"
+    }
+
     out = existing[:]
     for row in new_orders:
-        key = (row["symbol"], row["side"], row["setup_type"])
+        key = (row.get("symbol"), row.get("side"), row.get("setup_type"))
         if key in existing_keys:
             continue
         existing_keys.add(key)
@@ -78,17 +83,18 @@ def dedupe_orders(existing: List[Dict[str, Any]], new_orders: List[Dict[str, Any
 def generate_orders() -> None:
     existing_orders = load_open_orders()
     open_pos_symbols = load_open_positions_symbols()
-
     symbols = get_tradeable_symbols()
+
     setups: List[Dict[str, Any]] = []
 
-    log_message(f"ORDER_SCAN_START symbols={len(symbols)}", CONFIG.FILES.ORDER_LOG_FILE)
+    log_message(
+        f"ORDER_SCAN_START symbols={len(symbols)} open_orders={len(existing_orders)} open_positions={len(open_pos_symbols)}",
+        CONFIG.FILES.ORDER_LOG_FILE,
+    )
 
     for symbol in symbols:
         try:
             if symbol in open_pos_symbols:
-                continue
-            if any(r["symbol"] == symbol for r in existing_orders):
                 continue
 
             market = get_market_snapshot(symbol)
@@ -96,12 +102,24 @@ def generate_orders() -> None:
             if not setup:
                 continue
 
-            if setup["score"] < CONFIG.TRADE.SCORE_MIN:
-                continue
-            if setup["expected_net_pnl_pct"] < CONFIG.TRADE.MIN_EXPECTED_NET_PNL_PCT:
+            if any(
+                r.get("symbol") == symbol
+                and r.get("side") == setup.get("side")
+                and r.get("setup_type") == setup.get("setup_type")
+                for r in existing_orders
+            ):
                 continue
 
-            live_price = market["price"]
+            if int(safe_float(setup.get("score", 0))) < CONFIG.TRADE.SCORE_MIN:
+                continue
+
+            if safe_float(setup.get("expected_net_pnl_pct", 0)) < CONFIG.TRADE.MIN_EXPECTED_NET_PNL_PCT:
+                continue
+
+            live_price = safe_float(market.get("price", 0))
+            if live_price <= 0:
+                continue
+
             order_row = candidate_to_order(setup, live_price)
             setups.append(order_row)
 
@@ -109,6 +127,7 @@ def generate_orders() -> None:
             log_message(f"ORDER_SCAN_FAIL symbol={symbol} error={e}", CONFIG.FILES.ORDER_LOG_FILE)
 
     ranked = rank_setups(setups)
+
     free_slots = max(CONFIG.TRADE.MAX_OPEN_POSITIONS - len(open_pos_symbols), 0)
     selected = ranked[:free_slots]
 
@@ -131,18 +150,17 @@ def generate_orders() -> None:
     )
 
 
-def run_order_loop() -> None:
+def run_order() -> None:
+    time.sleep(1.5)
     log_message(
-        f"===== ORDER LOOP START mode={CONFIG.ENGINE.EXECUTION_MODE} =====",
+        f"===== ORDER START mode={CONFIG.ENGINE.EXECUTION_MODE} =====",
         CONFIG.FILES.ORDER_LOG_FILE,
     )
-    while True:
-        try:
-            generate_orders()
-        except Exception as e:
-            log_message(f"ORDER_LOOP_ERROR error={e}", CONFIG.FILES.ORDER_LOG_FILE)
-        time.sleep(CONFIG.TRADE.ORDER_LOOP_SECONDS)
+    try:
+        generate_orders()
+    except Exception as e:
+        log_message(f"ORDER_ERROR error={e}", CONFIG.FILES.ORDER_LOG_FILE)
 
 
 if __name__ == "__main__":
-    run_order_loop()
+    run_order()
