@@ -88,6 +88,19 @@ def alert_new_order(order: dict) -> None:
     send_telegram_message(text)
 
 
+def alert_real_order_entry(order: dict) -> None:
+    text = (
+        f"🟠 <b>REAL ORDER ENTRY</b>\n"
+        f"<b>{order['symbol']}</b> {order['side']}\n"
+        f"Type: {order.get('order_type', 'LIMIT')}\n"
+        f"Entry: {order.get('entry_trigger')}\n"
+        f"Qty: {order.get('submitted_qty')}\n"
+        f"Exchange Order ID: {order.get('exchange_order_id')}\n"
+        f"Exchange Status: {order.get('exchange_status')}"
+    )
+    send_telegram_message(text)
+
+
 def alert_position_opened(pos: dict) -> None:
     text = (
         f"🟢 <b>POSITION OPENED</b>\n"

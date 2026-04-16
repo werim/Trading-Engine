@@ -7,7 +7,7 @@ from binance_real import BinanceFuturesClient
 from config import CONFIG
 from market import get_market_snapshot, get_symbol_meta, get_tradeable_symbols
 from strategy import get_setup, rank_setups
-from telegram_alert import alert_new_order, alert_position_opened
+from telegram_alert import alert_new_order, alert_position_opened, alert_real_order_entry
 from utils import (
     log_message,
     new_order_id,
@@ -1072,6 +1072,7 @@ def _run_real_mode_execution(
                 f"exchange_order_id={row.get('exchange_order_id')} status={row.get('exchange_status')}",
                 ORDER_LOG_FILE,
             )
+            alert_real_order_entry(row)
         except Exception as e:
             row["status"] = "FAILED_SUBMIT"
             row["cancel_reason"] = "REAL_ENTRY_SUBMIT_EXCEPTION"
