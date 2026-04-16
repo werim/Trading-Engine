@@ -59,6 +59,8 @@ echo "========== TRADING ENGINE STOP =========="
 
 stop_by_pid_file "$ORDER_PID_FILE" "order.py"
 stop_by_pid_file "$POSITION_PID_FILE" "position.py"
+pkill -f position.py
+pkill -f order.py
 
 echo "All tracked engine processes stopped."
 echo "========================================"

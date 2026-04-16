@@ -7,7 +7,7 @@ from utils import (
     expected_net_pnl_pct,
     price_distance_pct,
     safe_float,
-    stop_net_loss_pct,
+    stop_net_loss_pct, log_message,
 )
 
 client = BinanceFuturesClient()
@@ -324,7 +324,6 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
     zone_low = entry - zone_half_atr
     zone_high = entry + zone_half_atr
     trigger = entry
-
     return {
         "symbol": symbol,
         "side": side,

@@ -23,7 +23,7 @@ python backtest.py \
   --rr-values 1.4,1.6,1.8,2.0,2.2 \
   --sl-multipliers 0.8,1.0,1.2,1.4 \
   --drawdown-penalty 0.7 \
-  --best-env-out backtest/4h_backtest.env
+  --best-env-out backtest/1d_backtest.env
   
 """
 

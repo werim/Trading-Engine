@@ -93,11 +93,11 @@ def alert_position_opened(pos: dict) -> None:
         f"🟢 <b>POSITION OPENED</b>\n"
         f"<b>{pos['symbol']}</b> {pos['side']}\n"
         f"Entry: {pos['entry']}\n"
-        f"Qty: {pos['qty']}\n"
         f"SL: {pos['sl']}\n"
         f"TP: {pos['tp']}\n"
+        f"PNL: {pos['net_pnl_pct']}%\n"
+        f"Score: {pos['score']}\n"
         f"RR: {pos['rr']}\n"
-        f"Score: {pos['score']}"
     )
     send_telegram_message(text)
 

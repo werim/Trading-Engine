@@ -197,6 +197,10 @@ def new_position_id(symbol: str, side: str) -> str:
     return f"pos-{symbol}-{side}-{stamp}"[-32:]
 
 
+def round_step_size(quantity: float, step_size: float) -> float:
+    return float(int(quantity / step_size) + step_size)
+
+
 def price_in_zone(live_price: float, zone_low: float, zone_high: float) -> bool:
     try:
         live_price = float(live_price)

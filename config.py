@@ -21,6 +21,7 @@ class BinanceConfig:
     BASE_URL: str = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").strip()
     RECV_WINDOW: int = int(os.getenv("BINANCE_RECV_WINDOW", "5000"))
     TESTNET: bool = os.getenv("BINANCE_TESTNET", "0") == "1"
+    EXCHANGE_INFO_TTL_SEC: int = int(os.getenv("EXCHANGE_INFO_TTL_SEC", "1800"))
 
 
 @dataclass
@@ -36,7 +37,7 @@ class TradeConfig:
     MTF_INTERVAL: str = os.getenv("MTF_INTERVAL", "4h")
     LTF_INTERVAL: str = os.getenv("LTF_INTERVAL", "1h")
     MICRO_INTERVAL: str = os.getenv("MICRO_INTERVAL", "15m")
-    KLINE_LIMIT: int = int(os.getenv("KLINE_LIMIT", "240"))
+    KLINE_LIMIT: int = int(os.getenv("KLINE_LIMIT", "200"))
 
     # Indicators
     EMA_FAST: int = int(os.getenv("EMA_FAST", "20"))
@@ -74,7 +75,7 @@ class TradeConfig:
 
     # Execution / sizing
     MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
-    USDT_PER_TRADE: float = float(os.getenv("USDT_PER_TRADE", "75"))
+    USDT_PER_TRADE: float = float(os.getenv("USDT_PER_TRADE", "35"))
     LEVERAGE: int = int(os.getenv("LEVERAGE", "3"))
     USE_LIMIT_ENTRY: bool = os.getenv("USE_LIMIT_ENTRY", "1") == "1"
     ENTRY_BUFFER_BPS: float = float(os.getenv("ENTRY_BUFFER_BPS", "4"))
@@ -121,6 +122,17 @@ class Config:
     BINANCE: BinanceConfig = field(default_factory=BinanceConfig)
     TRADE: TradeConfig = field(default_factory=TradeConfig)
     FILES: FileConfig = field(default_factory=FileConfig)
+
+
+class BINANCE:
+    FUTURES_BASE_URL = "https://fapi.binance.com"
+    REQUEST_TIMEOUT = 10
+    EXCHANGE_INFO_TTL_SEC = 1800
+    TICKER_CACHE_TTL_SEC = 2
+    BOOK_TICKER_STALE_OK_SEC = 10
+    NETWORK_COOLDOWN_SEC = 30
+    MAX_LOG_SAME_ERROR_EVERY_SEC = 20
+    USER_AGENT = "TradingEngine/1.0"
 
 
 CONFIG = Config()
