@@ -14,12 +14,6 @@ mkdir -p "$DATA_DIR" "$LOG_DIR" "$ARCHIVE_DIR"
 
 echo "========== TRADING ENGINE RESET =========="
 
-if [ -f "$BASE_DIR/stop.sh" ]; then
-  bash "$BASE_DIR/stop.sh"
-else
-  echo "stop.sh not found, skipping stop phase"
-fi
-
 mkdir -p "$ARCHIVE_DIR/$TIMESTAMP"
 
 archive_if_exists() {
