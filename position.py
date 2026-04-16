@@ -273,6 +273,38 @@ def _extract_position_qty_from_resp(resp: Any, symbol: str) -> Optional[float]:
     return None
 
 
+def _extract_position_entry_from_resp(resp: Any, symbol: str) -> Optional[float]:
+    if resp is None:
+        return None
+
+    if isinstance(resp, dict):
+        if resp.get("symbol") == symbol:
+            for key in ["entryPrice", "entry_price", "avgPrice", "avg_price"]:
+                if key in resp:
+                    v = safe_float(resp.get(key))
+                    if v > 0:
+                        return v
+
+        for key in ["entryPrice", "entry_price", "avgPrice", "avg_price"]:
+            if key in resp:
+                v = safe_float(resp.get(key))
+                if v > 0:
+                    return v
+
+    if isinstance(resp, list):
+        for item in resp:
+            if not isinstance(item, dict):
+                continue
+            if item.get("symbol") != symbol:
+                continue
+            for key in ["entryPrice", "entry_price", "avgPrice", "avg_price"]:
+                if key in item:
+                    v = safe_float(item.get(key))
+                    if v > 0:
+                        return v
+    return None
+
+
 def _get_exchange_position_qty(client: Any, symbol: str) -> Optional[float]:
     candidates = [
         (["get_position_qty", "get_position_amt", "fetch_position_qty"], {"symbol": symbol}),
@@ -292,6 +324,28 @@ def _get_exchange_position_qty(client: Any, symbol: str) -> Optional[float]:
     return None
 
 
+def _get_exchange_position_snapshot(client: Any, symbol: str) -> Dict[str, float]:
+    snapshot = {"qty": 0.0, "entry": 0.0}
+    candidates = [
+        (["get_position_risk", "position_risk"], {}),
+        (["get_position_information", "get_position_info", "position_information"], {"symbol": symbol}),
+    ]
+    for method_names, kwargs in candidates:
+        try:
+            resp = _safe_client_call(client, method_names, **kwargs)
+            qty = _extract_position_qty_from_resp(resp, symbol)
+            entry = _extract_position_entry_from_resp(resp, symbol)
+            if qty is not None:
+                snapshot["qty"] = qty
+            if entry is not None:
+                snapshot["entry"] = entry
+            if snapshot["qty"] > 0 or snapshot["entry"] > 0:
+                return snapshot
+        except Exception:
+            continue
+    return snapshot
+
+
 def _infer_close_reason_from_price(side: str, live_price: float, sl: float, tp: float) -> str:
     side = str(side).upper()
     if side == "LONG":
@@ -305,6 +359,22 @@ def _infer_close_reason_from_price(side: str, live_price: float, sl: float, tp: 
         if live_price <= tp:
             return "TP_HIT"
     return "CLOSED_ON_BINANCE"
+
+
+def _infer_close_reason_from_orders(client: Any, pos: Dict[str, Any], fallback_reason: str) -> str:
+    symbol = pos["symbol"]
+    sl_order_id = str(pos.get("sl_order_id", "")).strip()
+    tp_order_id = str(pos.get("tp_order_id", "")).strip()
+    sl_status = _get_order_status(client, symbol, sl_order_id) if sl_order_id else None
+    tp_status = _get_order_status(client, symbol, tp_order_id) if tp_order_id else None
+
+    if isinstance(sl_status, dict) and _normalize_binance_status(sl_status.get("status")) == "FILLED":
+        return "SL_HIT"
+    if isinstance(tp_status, dict) and _normalize_binance_status(tp_status.get("status")) == "FILLED":
+        return "TP_HIT"
+    if fallback_reason == "CLOSED_ON_BINANCE":
+        return "UNKNOWN_CLOSE"
+    return fallback_reason
 
 
 def _sync_position_qty_from_exchange(pos: Dict[str, Any]) -> Optional[float]:
@@ -321,6 +391,64 @@ def _sync_position_qty_from_exchange(pos: Dict[str, Any]) -> Optional[float]:
 
     pos["qty"] = round(qty, 8)
     return qty
+
+
+def _validate_realtime_protection(client: Any, pos: Dict[str, Any], symbol_meta: Dict[str, Any]) -> bool:
+    if CONFIG.ENGINE.EXECUTION_MODE != "REAL":
+        return True
+
+    symbol = pos["symbol"]
+    current_qty = safe_float(pos.get("qty"))
+    if current_qty <= 0:
+        pos["protection_armed"] = 0
+        return True
+
+    sl_order_id = str(pos.get("sl_order_id", "")).strip()
+    tp_order_id = str(pos.get("tp_order_id", "")).strip()
+    if not sl_order_id or not tp_order_id:
+        _safe_rearm_after_change(pos, symbol_meta)
+        return True
+
+    sl_status = _get_order_status(client, symbol, sl_order_id)
+    tp_status = _get_order_status(client, symbol, tp_order_id)
+
+    def _is_active(order_resp: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(order_resp, dict):
+            return False
+        return _normalize_binance_status(order_resp.get("status")) in {"NEW", "PARTIALLY_FILLED"}
+
+    sl_ok = _is_active(sl_status)
+    tp_ok = _is_active(tp_status)
+    if not sl_ok or not tp_ok:
+        _safe_rearm_after_change(pos, symbol_meta)
+        return True
+
+    sl_exec = _response_executed_qty(sl_status)
+    tp_exec = _response_executed_qty(tp_status)
+    if sl_exec > 0 or tp_exec > 0:
+        _safe_rearm_after_change(pos, symbol_meta)
+
+    pos["protection_armed"] = 1
+    return True
+
+
+def _dedupe_positions(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for pos in positions:
+        if pos.get("status") != "OPEN_POSITION":
+            deduped.append(pos)
+            continue
+        key = (str(pos.get("symbol", "")).upper(), str(pos.get("side", "")).upper())
+        if key in seen:
+            log_message(
+                f"DUPLICATE_OPEN_POSITION_DROPPED symbol={key[0]} side={key[1]} position_id={pos.get('position_id')}",
+                CONFIG.FILES.POSITION_LOG_FILE,
+            )
+            continue
+        seen.add(key)
+        deduped.append(pos)
+    return deduped
 
 
 # =========================================================
@@ -867,6 +995,11 @@ def immediate_close_reason_after_entry(order: Dict[str, Any], live_price: float)
 
 
 def process_orders_into_positions() -> None:
+    if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
+        # REAL modda entry emirleri order.py tarafından yönetilir.
+        # position.py sadece canlı pozisyonları yönetir.
+        return
+
     orders = load_open_orders()
     positions = load_open_positions()
     closed = load_closed_positions()
@@ -1061,7 +1194,7 @@ def execute_partial_close(pos: Dict[str, Any], close_ratio: float, symbol_meta: 
 # =========================================================
 
 def update_positions() -> None:
-    positions = load_open_positions()
+    positions = _dedupe_positions(load_open_positions())
     closed = load_closed_positions()
     updated_positions: List[Dict[str, Any]] = []
 
@@ -1089,10 +1222,24 @@ def update_positions() -> None:
 
             # REAL modda önce exchange qty ile senkron olmaya çalış
             if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
-                exchange_qty = _sync_position_qty_from_exchange(pos)
+                client = get_binance_client()
+                if client is None:
+                    raise RuntimeError("REAL mode active but Binance client could not be created")
 
-                if exchange_qty is not None and exchange_qty <= 0:
-                    close_reason = _infer_close_reason_from_price(side, live_price, sl, tp)
+                snapshot = _get_exchange_position_snapshot(client, pos["symbol"])
+                exchange_qty = safe_float(snapshot.get("qty"))
+                exchange_entry = safe_float(snapshot.get("entry"))
+
+                if exchange_entry > 0:
+                    pos["entry"] = round(exchange_entry, 8)
+                    entry = safe_float(pos["entry"])
+                if exchange_qty > 0:
+                    pos["qty"] = round(exchange_qty, 8)
+                    qty = safe_float(pos["qty"])
+
+                if exchange_qty <= 0:
+                    price_reason = _infer_close_reason_from_price(side, live_price, sl, tp)
+                    close_reason = _infer_close_reason_from_orders(client, pos, price_reason)
 
                     closed_row = _build_closed_row_from_position(pos, live_price, close_reason)
                     closed.append(closed_row)
@@ -1105,7 +1252,9 @@ def update_positions() -> None:
                     alert_position_closed(pos, close_reason)
                     continue
 
-                qty = safe_float(pos["qty"])
+                symbol_meta = get_symbol_meta(pos["symbol"])
+                if symbol_meta:
+                    _validate_realtime_protection(client, pos, symbol_meta)
 
             if initial_risk <= 0:
                 initial_risk = abs(entry - sl)
@@ -1241,21 +1390,24 @@ def update_positions() -> None:
 
             # 4) CLOSE CHECK
             if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
-                exchange_qty = _sync_position_qty_from_exchange(pos)
-                if exchange_qty is not None:
-                    if exchange_qty <= 0:
-                        close_reason = _infer_close_reason_from_price(side, live_price, safe_float(pos["sl"]), tp)
+                client = get_binance_client()
+                if client is None:
+                    raise RuntimeError("REAL mode active but Binance client could not be created")
+                exchange_qty = _get_exchange_position_qty(client, pos["symbol"])
+                if exchange_qty is not None and exchange_qty <= 0:
+                    price_reason = _infer_close_reason_from_price(side, live_price, safe_float(pos["sl"]), tp)
+                    close_reason = _infer_close_reason_from_orders(client, pos, price_reason)
 
-                        closed_row = _build_closed_row_from_position(pos, live_price, close_reason)
-                        closed.append(closed_row)
+                    closed_row = _build_closed_row_from_position(pos, live_price, close_reason)
+                    closed.append(closed_row)
 
-                        log_message(
-                            f"POSITION_CLOSED_ON_EXCHANGE {pos['symbol']} reason={close_reason} "
-                            f"net_pnl_pct={pos['net_pnl_pct']} mode={CONFIG.ENGINE.EXECUTION_MODE}",
-                            CONFIG.FILES.POSITION_LOG_FILE,
-                        )
-                        alert_position_closed(pos, close_reason)
-                        continue
+                    log_message(
+                        f"POSITION_CLOSED_ON_EXCHANGE {pos['symbol']} reason={close_reason} "
+                        f"net_pnl_pct={pos['net_pnl_pct']} mode={CONFIG.ENGINE.EXECUTION_MODE}",
+                        CONFIG.FILES.POSITION_LOG_FILE,
+                    )
+                    alert_position_closed(pos, close_reason)
+                    continue
 
                 # qty hala açıksa fiyat değdi diye kapatma yapma
                 # sadece protection pending logu bırak

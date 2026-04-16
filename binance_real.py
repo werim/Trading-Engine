@@ -98,6 +98,14 @@ class BinanceFuturesClient:
             params["symbol"] = symbol
         return self._request("GET", "/fapi/v1/openOrders", params, signed=True)
 
+    def get_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            "/fapi/v1/order",
+            {"symbol": symbol, "orderId": order_id},
+            signed=True,
+        )
+
     def place_limit_order(
         self,
         symbol: str,

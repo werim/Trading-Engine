@@ -167,6 +167,8 @@ def order_fieldnames() -> List[str]:
         "tf_context", "setup_type", "setup_reason",
         "created_at", "updated_at", "expires_at",
         "status", "live_price",
+        "exchange_order_id", "exchange_status", "order_type",
+        "submitted_qty", "executed_qty", "avg_fill_price",
         "zone_touched", "alarm_touched_sent", "alarm_near_trigger_sent",
         "last_alarm_at", "expected_net_pnl_pct",
         "stop_net_loss_pct", "volume_24h_usdt", "spread_pct",
