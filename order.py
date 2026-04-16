@@ -876,8 +876,8 @@ def generate_orders() -> None:
     existing_open_orders = [r for r in all_orders if r.get("status") == "OPEN_ORDER"]
     symbols = get_tradeable_symbols()
     log_message(
-        f"ORDER_SCAN_START symbols={len(symbols)} open_orders={len(existing_open_orders)}\n "
-        f"positions={len(open_pos_symbols)} max_open_orders={_get_max_open_orders()}\n"
+        f"ORDER_SCAN_START symbols={len(symbols)} open_orders={len(existing_open_orders)} "
+        f"positions={len(open_pos_symbols)} max_open_orders={_get_max_open_orders()}"
         f"pre_cancelled={pre_cancelled}",
         ORDER_LOG_FILE,
     )
@@ -930,7 +930,7 @@ def generate_orders() -> None:
 
     log_message(
         f"ORDER_SCAN_DONE candidates={len(candidate_orders)} new_selected={len(selected_new_orders)} "
-        f"symbols={len(symbols)}refreshed={refreshed_count} cancelled={cancelled_count} "
+        f"symbols={len(symbols)} refreshed={refreshed_count} cancelled={cancelled_count} "
         f"post_cancelled={post_cancelled} total_open_orders={total_open_orders}",
         ORDER_LOG_FILE,
     )
