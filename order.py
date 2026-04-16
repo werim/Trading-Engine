@@ -129,7 +129,7 @@ def load_all_orders() -> List[Dict[str, Any]]:
 
 def load_open_orders() -> List[Dict[str, Any]]:
     rows = load_all_orders()
-    return [r for r in rows if r.get("status") == "OPEN_ORDER"]
+    return [r for r in rows if str(r.get("status", "")).strip() == "OPEN_ORDER"]
 
 
 def save_all_orders(rows: List[Dict[str, Any]]) -> None:
@@ -178,10 +178,6 @@ def order_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
 
 
 def _row_ts_for_priority(row: Dict[str, Any]) -> datetime:
-    """
-    Yeni olan kazanmalı.
-    created_at öncelikli, yoksa updated_at.
-    """
     created_at = _parse_utc_dt(str(row.get("created_at", "")).strip())
     if created_at:
         return created_at
@@ -201,6 +197,7 @@ def cancel_order(row: Dict[str, Any], reason: str) -> Dict[str, Any]:
     row = dict(row)
     row["status"] = "CANCELLED"
     row["updated_at"] = utc_now_str()
+    row["cancel_reason"] = reason
     log_message(
         f"ORDER_CANCEL {row.get('symbol')} {row.get('side')} setup={row.get('setup_type')} reason={reason}",
         ORDER_LOG_FILE,
@@ -222,6 +219,20 @@ def is_order_expired(row: Dict[str, Any]) -> bool:
         return False
 
     return _utc_now_dt() >= expires_dt
+
+
+def _price_in_entry_zone(side: str, live_price: float, zone_low: float, zone_high: float) -> bool:
+    _ = side
+    if live_price <= 0:
+        return False
+
+    low = min(safe_float(zone_low), safe_float(zone_high))
+    high = max(safe_float(zone_low), safe_float(zone_high))
+
+    if low <= 0 or high <= 0:
+        return False
+
+    return low <= live_price <= high
 
 
 def candidate_to_order(setup: Dict[str, Any], live_price: float) -> Dict[str, Any]:
@@ -251,7 +262,12 @@ def candidate_to_order(setup: Dict[str, Any], live_price: float) -> Dict[str, An
         "submitted_qty": 0.0,
         "executed_qty": 0.0,
         "avg_fill_price": 0.0,
-        "zone_touched": 0,
+        "zone_touched": 1 if _price_in_entry_zone(
+            side=setup["side"],
+            live_price=live_price,
+            zone_low=safe_float(setup.get("entry_zone_low", 0)),
+            zone_high=safe_float(setup.get("entry_zone_high", 0)),
+        ) else 0,
         "alarm_touched_sent": 0,
         "alarm_near_trigger_sent": 0,
         "last_alarm_at": "",
@@ -260,7 +276,136 @@ def candidate_to_order(setup: Dict[str, Any], live_price: float) -> Dict[str, An
         "volume_24h_usdt": safe_float(setup.get("volume_24h_usdt", 0)),
         "spread_pct": safe_float(setup.get("spread_pct", 0)),
         "funding_rate_pct": safe_float(setup.get("funding_rate_pct", 0)),
+        "cancel_reason": "",
     }
+
+
+def _parse_minutes_ago(minutes: float) -> datetime:
+    return _utc_now_dt() - timedelta(minutes=float(minutes))
+
+
+def _setup_fingerprint(row: Dict[str, Any]) -> str:
+    return "|".join([
+        str(row.get("symbol", "")).strip().upper(),
+        str(row.get("side", "")).strip().upper(),
+        str(row.get("setup_type", "")).strip().upper(),
+        f"{safe_float(row.get('entry_trigger', 0)):.8f}",
+        f"{safe_float(row.get('sl', 0)):.8f}",
+        f"{safe_float(row.get('tp', 0)):.8f}",
+    ])
+
+
+def _row_last_ts(row: Dict[str, Any]) -> Optional[datetime]:
+    updated_at = _parse_utc_dt(str(row.get("updated_at", "")).strip())
+    if updated_at:
+        return updated_at
+
+    created_at = _parse_utc_dt(str(row.get("created_at", "")).strip())
+    if created_at:
+        return created_at
+
+    return None
+
+
+def _recent_terminal_orders(all_orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    terminal_statuses = {
+        "CANCELLED",
+        "CANCELED",
+        "EXPIRED",
+        "REJECTED",
+        "FAILED_SUBMIT",
+        "FAILED_QTY",
+    }
+    return [r for r in all_orders if str(r.get("status", "")).strip().upper() in terminal_statuses]
+
+
+def _is_recent_same_symbol_terminal(
+    symbol: str,
+    all_orders: List[Dict[str, Any]],
+    cooldown_minutes: float,
+) -> bool:
+    cutoff = _parse_minutes_ago(cooldown_minutes)
+    symbol = str(symbol).strip().upper()
+
+    for row in _recent_terminal_orders(all_orders):
+        if str(row.get("symbol", "")).strip().upper() != symbol:
+            continue
+
+        ts = _row_last_ts(row)
+        if ts and ts >= cutoff:
+            return True
+
+    return False
+
+
+def _is_recent_same_setup_terminal(
+    candidate_row: Dict[str, Any],
+    all_orders: List[Dict[str, Any]],
+    cooldown_minutes: float,
+) -> bool:
+    cutoff = _parse_minutes_ago(cooldown_minutes)
+    fp = _setup_fingerprint(candidate_row)
+
+    for row in _recent_terminal_orders(all_orders):
+        ts = _row_last_ts(row)
+        if not ts or ts < cutoff:
+            continue
+
+        if _setup_fingerprint(row) == fp:
+            return True
+
+    return False
+
+
+def _symbol_cancel_count_recent(
+    symbol: str,
+    all_orders: List[Dict[str, Any]],
+    window_minutes: float,
+) -> int:
+    cutoff = _parse_minutes_ago(window_minutes)
+    symbol = str(symbol).strip().upper()
+    count = 0
+
+    for row in all_orders:
+        status = str(row.get("status", "")).strip().upper()
+        if status not in {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED"}:
+            continue
+
+        if str(row.get("symbol", "")).strip().upper() != symbol:
+            continue
+
+        ts = _row_last_ts(row)
+        if ts and ts >= cutoff:
+            count += 1
+
+    return count
+
+
+def _is_symbol_cancel_locked(symbol: str, all_orders: List[Dict[str, Any]]) -> bool:
+    window_minutes = float(getattr(CONFIG.TRADE, "ORDER_CANCEL_LOCK_WINDOW_MINUTES", 10))
+    lock_count = int(getattr(CONFIG.TRADE, "ORDER_CANCEL_LOCK_COUNT", 3))
+    lock_minutes = float(getattr(CONFIG.TRADE, "ORDER_CANCEL_LOCK_MINUTES", 15))
+
+    recent_count = _symbol_cancel_count_recent(symbol, all_orders, window_minutes)
+    if recent_count < lock_count:
+        return False
+
+    cutoff = _parse_minutes_ago(lock_minutes)
+    symbol = str(symbol).strip().upper()
+
+    for row in all_orders:
+        if str(row.get("symbol", "")).strip().upper() != symbol:
+            continue
+
+        status = str(row.get("status", "")).strip().upper()
+        if status not in {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED"}:
+            continue
+
+        ts = _row_last_ts(row)
+        if ts and ts >= cutoff:
+            return True
+
+    return False
 
 
 def is_better_order(new_row: Dict[str, Any], old_row: Dict[str, Any]) -> bool:
@@ -287,9 +432,9 @@ def is_better_order(new_row: Dict[str, Any], old_row: Dict[str, Any]) -> bool:
         return True
     if new_vol < old_vol:
         return False
+
+    # Tam eşitlikte eski kalsın
     return False
-    # Tam eşitlikte yeni olan kazansın
-    # return _row_ts_for_priority(new_row) >= _row_ts_for_priority(old_row)
 
 
 def refresh_existing_order(old_row: Dict[str, Any], new_row: Dict[str, Any]) -> Dict[str, Any]:
@@ -327,7 +472,7 @@ def refresh_existing_order(old_row: Dict[str, Any], new_row: Dict[str, Any]) -> 
 def dedupe_candidate_orders(candidate_orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Aynı coin için tek candidate bırak.
-    Yüksek score kalır, eşitse yeni olan kalır.
+    Yüksek score kalır, eşitse eski kalır.
     """
     best_by_symbol: Dict[str, Dict[str, Any]] = {}
 
@@ -346,14 +491,31 @@ def dedupe_candidate_orders(candidate_orders: List[Dict[str, Any]]) -> List[Dict
 
 def build_candidate_orders(
     symbols: List[str],
-    existing_open_orders: List[Dict[str, Any]],
+    all_orders: List[Dict[str, Any]],
     open_pos_symbols: Set[str],
 ) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
 
+    symbol_cooldown = float(getattr(CONFIG.TRADE, "ORDER_RECREATE_COOLDOWN_MINUTES", 5))
+    setup_cooldown = float(getattr(CONFIG.TRADE, "ORDER_SAME_SETUP_COOLDOWN_MINUTES", 10))
+
     for symbol in symbols:
         try:
             if symbol in open_pos_symbols:
+                continue
+
+            if _is_recent_same_symbol_terminal(symbol, all_orders, symbol_cooldown):
+                log_message(
+                    f"ORDER_SKIP_RECENT_SYMBOL_TERMINAL symbol={symbol} cooldown_min={symbol_cooldown}",
+                    ORDER_LOG_FILE,
+                )
+                continue
+
+            if _is_symbol_cancel_locked(symbol, all_orders):
+                log_message(
+                    f"ORDER_SKIP_SYMBOL_CANCEL_LOCK symbol={symbol}",
+                    ORDER_LOG_FILE,
+                )
                 continue
 
             market = get_market_snapshot(symbol)
@@ -361,7 +523,6 @@ def build_candidate_orders(
                 continue
 
             setup = get_setup(symbol, market)
-
             if not setup:
                 continue
 
@@ -376,12 +537,72 @@ def build_candidate_orders(
                 continue
 
             row = candidate_to_order(setup, live_price)
+
+            if _is_recent_same_setup_terminal(row, all_orders, setup_cooldown):
+                log_message(
+                    f"ORDER_SKIP_RECENT_SAME_SETUP symbol={symbol} fp={_setup_fingerprint(row)} cooldown_min={setup_cooldown}",
+                    ORDER_LOG_FILE,
+                )
+                continue
+
             candidates.append(row)
 
         except Exception as e:
             log_message(f"ORDER_SCAN_FAIL symbol={symbol} error={e}", ORDER_LOG_FILE)
 
     return dedupe_candidate_orders(candidates)
+
+
+def refresh_open_order_market_state(all_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    refreshed_rows: List[Dict[str, Any]] = []
+
+    for row in all_rows:
+        if str(row.get("status", "")).strip() != "OPEN_ORDER":
+            refreshed_rows.append(row)
+            continue
+
+        symbol = str(row.get("symbol", "")).strip()
+        if not symbol:
+            refreshed_rows.append(row)
+            continue
+
+        try:
+            market = get_market_snapshot(symbol)
+            if not market:
+                refreshed_rows.append(row)
+                continue
+
+            live_price = safe_float(market.get("price", 0))
+            new_row = dict(row)
+
+            if live_price > 0:
+                new_row["live_price"] = round(live_price, 8)
+
+            new_row["updated_at"] = utc_now_str()
+
+            if _price_in_entry_zone(
+                side=str(row.get("side", "")).strip(),
+                live_price=live_price,
+                zone_low=safe_float(row.get("entry_zone_low", 0)),
+                zone_high=safe_float(row.get("entry_zone_high", 0)),
+            ):
+                if int(safe_float(row.get("zone_touched", 0))) != 1:
+                    new_row["zone_touched"] = 1
+                    log_message(
+                        f"ORDER_ZONE_TOUCHED symbol={symbol} side={row.get('side')} "
+                        f"price={live_price} zone=({row.get('entry_zone_low')}, {row.get('entry_zone_high')})",
+                        ORDER_LOG_FILE,
+                    )
+                else:
+                    new_row["zone_touched"] = 1
+
+            refreshed_rows.append(new_row)
+
+        except Exception as e:
+            log_message(f"ORDER_MARKET_REFRESH_FAIL symbol={symbol} error={e}", ORDER_LOG_FILE)
+            refreshed_rows.append(row)
+
+    return refreshed_rows
 
 
 def cleanup_order_book(
@@ -395,9 +616,9 @@ def cleanup_order_book(
     - open position varsa open order iptal
     - pozisyonlara geçmiş order_id tekrar OPEN_ORDER olamaz
     - aynı symbol için birden fazla OPEN_ORDER varsa:
-      yüksek score kalır, eşitse yeni kalır, eski CANCELLED
+      yüksek score kalır, eşitse eski kalır
     """
-    cleaned_rows: List[Dict[str, Any]] = []
+    result_rows: List[Dict[str, Any]] = []
     cancelled_count = 0
 
     open_rows_by_symbol: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
@@ -408,71 +629,56 @@ def cleanup_order_book(
         order_id = str(row.get("order_id", "")).strip()
 
         if status != "OPEN_ORDER":
-            cleaned_rows.append(row)
+            result_rows.append(row)
             continue
 
         if symbol in open_pos_symbols:
-            cleaned_rows.append(cancel_order(row, f"{stage}_HAS_OPEN_POSITION"))
+            result_rows.append(cancel_order(row, f"{stage}_HAS_OPEN_POSITION"))
             cancelled_count += 1
             continue
 
         if order_id and order_id in position_order_ids:
-            cleaned_rows.append(cancel_order(row, f"{stage}_FILLED_CONFLICT"))
+            result_rows.append(cancel_order(row, f"{stage}_FILLED_CONFLICT"))
             cancelled_count += 1
             continue
 
         open_rows_by_symbol.setdefault(symbol, []).append((idx, row))
 
-    keep_by_original_index: Set[int] = set()
-    cancel_by_original_index: Dict[int, Dict[str, Any]] = {}
+    best_index_by_symbol: Dict[str, int] = {}
+    cancelled_open_rows_by_index: Dict[int, Dict[str, Any]] = {}
 
     for symbol, indexed_rows in open_rows_by_symbol.items():
-        if not indexed_rows:
-            continue
-
-        # en iyi row'u seç
         best_idx, best_row = indexed_rows[0]
+
         for idx, row in indexed_rows[1:]:
             if is_better_order(row, best_row):
                 best_idx, best_row = idx, row
 
-        keep_by_original_index.add(best_idx)
+        best_index_by_symbol[symbol] = best_idx
 
         for idx, row in indexed_rows:
             if idx == best_idx:
                 continue
 
-            reason = f"{stage}_DUPLICATE_SYMBOL_LOST"
-            if _row_score(row) == _row_score(best_row):
-                reason = f"{stage}_DUPLICATE_SYMBOL_EQUAL_SCORE_OLDER_CANCELLED"
-
-            cancel_by_original_index[idx] = cancel_order(row, reason)
+            cancelled_open_rows_by_index[idx] = cancel_order(
+                row,
+                f"{stage}_DUPLICATE_SYMBOL_OLDER_OR_WEAKER_CANCELLED",
+            )
             cancelled_count += 1
 
-    # sırayı koruyarak birleştir
-    passthrough_open_rows: Dict[int, Dict[str, Any]] = {}
-    for symbol_rows in open_rows_by_symbol.values():
-        for idx, row in symbol_rows:
-            if idx in keep_by_original_index:
-                passthrough_open_rows[idx] = row
+    for symbol, indexed_rows in open_rows_by_symbol.items():
+        best_idx = best_index_by_symbol[symbol]
+        for idx, row in indexed_rows:
+            if idx == best_idx:
+                result_rows.append(row)
+            elif idx in cancelled_open_rows_by_index:
+                result_rows.append(cancelled_open_rows_by_index[idx])
 
-    for idx, row in enumerate(all_orders):
-        status = str(row.get("status", "")).strip()
-
-        if status != "OPEN_ORDER":
-            continue
-
-        if idx in cancel_by_original_index:
-            cleaned_rows.append(cancel_by_original_index[idx])
-        elif idx in passthrough_open_rows:
-            cleaned_rows.append(passthrough_open_rows[idx])
-
-    # stable sort by created/updated order is not needed because we preserved input order
     log_message(
         f"ORDER_CLEANUP stage={stage} cancelled={cancelled_count}",
         ORDER_LOG_FILE,
     )
-    return cleaned_rows, cancelled_count
+    return result_rows, cancelled_count
 
 
 def reconcile_orders(
@@ -484,39 +690,28 @@ def reconcile_orders(
     Coin başına tek açık order kuralı:
     - mevcut OPEN_ORDER varsa candidate ile kıyaslanır
     - yüksek score kalır
-    - eşitse yeni candidate kalır, eski CANCELLED olur
+    - eşitse eski kalır
     """
     selected_new_orders: List[Dict[str, Any]] = []
     refreshed_count = 0
     cancelled_count = 0
 
     output_rows: List[Dict[str, Any]] = []
+    non_open_rows: List[Dict[str, Any]] = []
 
     max_open_orders = _get_max_open_orders()
     current_open_orders_count = 0
 
-    existing_open_by_symbol: Dict[str, Dict[str, Any]] = {}
-    non_open_rows: List[Dict[str, Any]] = []
-
-    for row in all_orders:
-        if str(row.get("status", "")).strip() == "OPEN_ORDER":
-            symbol = str(row.get("symbol", "")).strip()
-            if symbol:
-                existing_open_by_symbol[symbol] = row
-            else:
-                non_open_rows.append(row)
-        else:
-            non_open_rows.append(row)
-
     candidate_by_symbol: Dict[str, Dict[str, Any]] = {
-        str(r.get("symbol", "")).strip(): r for r in candidate_orders if str(r.get("symbol", "")).strip()
+        str(r.get("symbol", "")).strip(): r
+        for r in candidate_orders
+        if str(r.get("symbol", "")).strip()
     }
-
     processed_symbols: Set[str] = set()
 
-    # önce mevcut open order'lar
     for row in all_orders:
         if str(row.get("status", "")).strip() != "OPEN_ORDER":
+            non_open_rows.append(row)
             continue
 
         symbol = str(row.get("symbol", "")).strip()
@@ -537,28 +732,27 @@ def reconcile_orders(
 
         new_candidate = candidate_by_symbol.get(symbol)
         if not new_candidate:
-            output_rows.append(cancel_order(row, "SETUP_GONE"))
-            cancelled_count += 1
+            keep_row = dict(row)
+            keep_row["updated_at"] = utc_now_str()
+            output_rows.append(keep_row)
+            refreshed_count += 1
+            current_open_orders_count += 1
             continue
 
         if is_better_order(new_candidate, row):
-            # yeni daha iyi ya da eşitlikte yeni kazandı
-            output_rows.append(cancel_order(row, "REPLACED_BY_BETTER_OR_EQUAL_NEW_SYMBOL_ORDER"))
+            output_rows.append(cancel_order(row, "REPLACED_BY_BETTER_NEW_SYMBOL_ORDER"))
             output_rows.append(new_candidate)
             selected_new_orders.append(new_candidate)
             cancelled_count += 1
             current_open_orders_count += 1
         else:
-            keep_row = dict(row)
-            keep_row["live_price"] = new_candidate.get("live_price", keep_row.get("live_price", 0))
-            keep_row["updated_at"] = utc_now_str()
+            keep_row = refresh_existing_order(row, new_candidate)
             output_rows.append(keep_row)
             refreshed_count += 1
             current_open_orders_count += 1
 
         candidate_by_symbol.pop(symbol, None)
 
-    # mevcut open order'ı olmayan symbol'lerden yeni ekle
     ranked_remaining = rank_setups(list(candidate_by_symbol.values()))
     free_order_slots = max(max_open_orders - current_open_orders_count, 0)
 
@@ -571,7 +765,6 @@ def reconcile_orders(
         selected_new_orders.append(row)
         current_open_orders_count += 1
 
-    # non-open rows da en başta ekleyelim
     final_rows = non_open_rows + output_rows
     return final_rows, selected_new_orders, refreshed_count, cancelled_count
 
@@ -661,12 +854,15 @@ def _calc_submitted_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> f
     entry = safe_float(order.get("entry_trigger"))
     if entry <= 0:
         return 0.0
+
     raw_qty = (CONFIG.TRADE.USDT_PER_TRADE * CONFIG.TRADE.LEVERAGE) / entry
     qty_step = safe_float(symbol_meta.get("qty_step") or symbol_meta.get("stepSize"))
     min_qty = safe_float(symbol_meta.get("min_qty") or symbol_meta.get("minQty"))
+
     qty = round_step(raw_qty, qty_step) if qty_step > 0 else raw_qty
     if min_qty > 0 and qty < min_qty:
         qty = min_qty
+
     return qty
 
 
@@ -687,6 +883,7 @@ def _resolve_filled_order(
 
     avg_price = _response_avg_price(status_resp)
     executed_qty = _response_executed_qty(status_resp)
+
     if avg_price <= 0:
         avg_price = safe_float(order_row.get("entry_trigger"))
     if executed_qty <= 0:
@@ -741,13 +938,16 @@ def _run_real_mode_execution(
 
     open_pos_symbols = _exchange_open_position_symbols(client)
     row_by_order_id = {
-        str(r.get("order_id", "")).strip(): r for r in all_rows if str(r.get("order_id", "")).strip()
+        str(r.get("order_id", "")).strip(): r
+        for r in all_rows
+        if str(r.get("order_id", "")).strip()
     }
 
     # 1) Sync existing submitted orders with Binance truth.
     for row in all_rows:
         if row.get("status") != "OPEN_ORDER":
             continue
+
         exchange_order_id = str(row.get("exchange_order_id", "")).strip()
         if not exchange_order_id:
             continue
@@ -762,32 +962,47 @@ def _run_real_mode_execution(
 
             if status == "FILLED":
                 row_by_order_id[row["order_id"]] = _resolve_filled_order(client, row, status_resp)
-            elif status in {"CANCELED", "EXPIRED", "REJECTED"}:
-                row["status"] = status
+            elif status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                row["status"] = "CANCELLED" if status in {"CANCELED", "CANCELLED"} else status
+                row["cancel_reason"] = f"EXCHANGE_{status}"
         except Exception as e:
             log_message(
                 f"REAL_ORDER_SYNC_FAIL symbol={row.get('symbol')} local_order_id={row.get('order_id')} error={e}",
                 ORDER_LOG_FILE,
             )
 
-    # 2) Submit new candidates only when no open position/order exists.
+    # 2) Submit only new local OPEN_ORDER rows that are zone_touched.
     for candidate in selected_new_orders:
         local_order_id = str(candidate.get("order_id", "")).strip()
         row = row_by_order_id.get(local_order_id)
+
         if not row or row.get("status") != "OPEN_ORDER":
             continue
+
         if str(row.get("exchange_order_id", "")).strip():
+            continue
+
+        if int(safe_float(row.get("zone_touched", 0))) != 1:
+            log_message(
+                f"REAL_WAIT_ZONE_TOUCH symbol={row.get('symbol')} side={row.get('side')} "
+                f"price={row.get('live_price')} zone=({row.get('entry_zone_low')}, {row.get('entry_zone_high')})",
+                ORDER_LOG_FILE,
+            )
             continue
 
         symbol = str(row.get("symbol", "")).strip()
         if not symbol:
             continue
+
         if symbol in open_pos_symbols:
             row["status"] = "CANCELLED"
+            row["cancel_reason"] = "REAL_HAS_OPEN_POSITION"
             row["updated_at"] = utc_now_str()
             continue
+
         if symbol in open_orders_by_symbol:
             row["status"] = "CANCELLED"
+            row["cancel_reason"] = "REAL_ALREADY_HAS_EXCHANGE_OPEN_ORDER"
             row["updated_at"] = utc_now_str()
             log_message(f"REAL_SKIP_EXISTING_OPEN_ORDER symbol={symbol}", ORDER_LOG_FILE)
             continue
@@ -795,12 +1010,14 @@ def _run_real_mode_execution(
         symbol_meta = get_symbol_meta(symbol)
         if not symbol_meta:
             row["status"] = "CANCELLED"
+            row["cancel_reason"] = "REAL_SYMBOL_META_MISSING"
             row["updated_at"] = utc_now_str()
             continue
 
         qty = _calc_submitted_qty(row, symbol_meta)
         if qty <= 0:
             row["status"] = "FAILED_QTY"
+            row["cancel_reason"] = "REAL_QTY_CALC_FAILED"
             row["updated_at"] = utc_now_str()
             continue
 
@@ -811,6 +1028,7 @@ def _run_real_mode_execution(
 
         try:
             client.set_leverage(symbol, CONFIG.TRADE.LEVERAGE)
+
             if order_type == "MARKET":
                 resp = client.place_market_order(
                     symbol=symbol,
@@ -843,6 +1061,9 @@ def _run_real_mode_execution(
                 if row["exchange_status"] == "FILLED":
                     row_by_order_id[row["order_id"]] = _resolve_filled_order(client, row, status_resp)
                     open_pos_symbols.add(symbol)
+                elif row["exchange_status"] in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
+                    row["status"] = "CANCELLED" if row["exchange_status"] in {"CANCELED", "CANCELLED"} else row["exchange_status"]
+                    row["cancel_reason"] = f"SUBMIT_RESULT_{row['exchange_status']}"
                 else:
                     open_orders_by_symbol[symbol] = status_resp
 
@@ -853,6 +1074,7 @@ def _run_real_mode_execution(
             )
         except Exception as e:
             row["status"] = "FAILED_SUBMIT"
+            row["cancel_reason"] = "REAL_ENTRY_SUBMIT_EXCEPTION"
             row["updated_at"] = utc_now_str()
             log_message(f"REAL_ENTRY_SUBMIT_FAIL symbol={symbol} error={e}", ORDER_LOG_FILE)
 
@@ -873,18 +1095,23 @@ def generate_orders() -> None:
     )
     save_all_orders(all_orders)
 
+    # Açık local order'ların live_price / zone_touched bilgisini güncelle
+    all_orders = refresh_open_order_market_state(all_orders)
+    save_all_orders(all_orders)
+
     existing_open_orders = [r for r in all_orders if r.get("status") == "OPEN_ORDER"]
     symbols = get_tradeable_symbols()
+
     log_message(
         f"ORDER_SCAN_START symbols={len(symbols)} open_orders={len(existing_open_orders)} "
-        f"positions={len(open_pos_symbols)} max_open_orders={_get_max_open_orders()}"
+        f"positions={len(open_pos_symbols)} max_open_orders={_get_max_open_orders()} "
         f"pre_cancelled={pre_cancelled}",
         ORDER_LOG_FILE,
     )
 
     candidate_orders = build_candidate_orders(
         symbols=symbols,
-        existing_open_orders=existing_open_orders,
+        all_orders=all_orders,
         open_pos_symbols=open_pos_symbols,
     )
 
@@ -913,14 +1140,24 @@ def generate_orders() -> None:
 
     save_all_orders(final_rows)
 
-    for row in selected_new_orders:
-        if str(row.get("status", "")).strip() != "OPEN_ORDER":
-            continue
+    selected_order_ids = {
+        str(r.get("order_id", "")).strip()
+        for r in selected_new_orders
+        if str(r.get("order_id", "")).strip()
+    }
 
+    final_selected_open_rows = [
+        r for r in final_rows
+        if str(r.get("order_id", "")).strip() in selected_order_ids
+        and str(r.get("status", "")).strip() == "OPEN_ORDER"
+    ]
+
+    for row in final_selected_open_rows:
         log_message(
             f"NEW_ORDER {row['symbol']} {row['side']} trigger={row['entry_trigger']} "
             f"sl={row['sl']} tp={row['tp']} score={row['score']} rr={row['rr']} "
-            f"exp_net={row['expected_net_pnl_pct']} vol24h={row['volume_24h_usdt']}",
+            f"exp_net={row['expected_net_pnl_pct']} vol24h={row['volume_24h_usdt']} "
+            f"zone_touched={row.get('zone_touched', 0)}",
             ORDER_LOG_FILE,
         )
         if getattr(CONFIG.TRADE, "ORDER_ALERT", False):
@@ -938,11 +1175,6 @@ def generate_orders() -> None:
 
 def run_order() -> None:
     time.sleep(1.5)
-    """
-    log_message(
-        f"===== ORDER START mode={CONFIG.ENGINE.EXECUTION_MODE} =====",
-        ORDER_LOG_FILE,
-    )"""
     try:
         generate_orders()
     except Exception as e:
