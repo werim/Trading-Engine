@@ -11,7 +11,7 @@ import market
 import optimizer
 import risk
 import storage
-import liquidity_map
+import liquidity_map_sniper as liquidity_map
 import market_regime
 import order_planner
 import scenario_engine
