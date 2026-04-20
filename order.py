@@ -13,8 +13,8 @@ import risk
 import storage
 import liquidity_map_sniper as liquidity_map
 import market_regime
-import order_planner
-import scenario_engine
+import order_planner_sniper as order_planner
+import scenario_engine_sniper as scenario_engine
 from config import CONFIG
 from logger import get_logger
 from notifier import notify_order_created, notify_real_order_submitted
@@ -829,7 +829,7 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tuple[float, Optional[str]]:
-    account_balance = 1000.0
+    account_balance = binance.get_available_balance("USDT")
     qty = risk.calc_position_size(
         entry=safe_float(order["entry_trigger"]),
         sl=safe_float(order["sl"]),
