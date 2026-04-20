@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import csv
 import os
@@ -134,6 +135,9 @@ def _build_fallback_order_candidate(symbol: str, market_ctx: Dict[str, Any]) -> 
         tp = entry_trigger - (sl - entry_trigger) * CONFIG.STRATEGY.PULLBACK_RR_MULT
 
     else:
+        return None
+    distance_pct = abs(last_price - entry_trigger) / last_price * 100.0
+    if distance_pct > 3.0:
         return None
 
     rr = calc_rr(entry_trigger, sl, tp, side)
@@ -988,6 +992,18 @@ def should_skip_order_update(order: Dict[str, Any]) -> bool:
     return is_final_order_status(order.get("status"))
 
 
+def get_order_age_minutes(order: Dict[str, Any]) -> float:
+    created_at = order.get("created_at")
+    if not created_at:
+        return 0.0
+    try:
+        dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return (now - dt).total_seconds() / 60.0
+    except Exception:
+        return 0.0
+
+
 def process_existing_order(
     order: Dict[str, Any],
     market_ctx: Dict[str, Any],
@@ -998,6 +1014,17 @@ def process_existing_order(
         return order
 
     order = update_virtual_order_market_state(order, market_ctx)
+
+    # ⏳ STALE WATCHING ORDER CLEANUP
+    status = get_order_status(order)
+
+    if status in {"WATCHING", "PLANNED"}:
+        age_min = get_order_age_minutes(order)
+
+        if age_min > 240 and int(order.get("zone_touched", 0)) == 0:
+            order["status"] = "EXPIRED"
+            order["exchange_status"] = "STALE_NO_TOUCH"
+            return stamp_updated(order)
 
     if get_order_status(order) == "READY":
         ok, reason = risk.can_open_new_order(order, open_orders, open_positions)

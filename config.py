@@ -66,6 +66,7 @@ class StrategyConfig:
 @dataclass(frozen=True)
 class FilesConfig:
     OPEN_ORDERS_CSV: str = "data/open_orders.csv"
+    CLOSED_ORDERS_CSV: str = "data/closed_orders.csv"
     OPEN_POSITIONS_CSV: str = "data/open_positions.csv"
     CLOSED_POSITIONS_CSV: str = "data/closed_positions.csv"
     FILLS_CSV: str = "data/fills.csv"
