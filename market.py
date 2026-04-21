@@ -98,17 +98,11 @@ def get_tf_snapshot(symbol: str, interval: str, limit: int = 200) -> Dict[str, A
 def build_market_context(symbol: str) -> Dict[str, Any]:
     ticker = binance.get_24h_ticker(symbol)
     book = get_book_snapshot(symbol)
+    open_interest = binance.get_open_interest(symbol)
 
     tf_1h = get_tf_snapshot(symbol, "1h")
     tf_4h = get_tf_snapshot(symbol, "4h")
     tf_1d = get_tf_snapshot(symbol, "1d")
-
-    try:
-        funding_rate = binance.get_funding_rate(symbol)
-        funding_available = 1
-    except Exception:
-        funding_rate = 0.0
-        funding_available = 0
 
     return {
         "symbol": symbol,
@@ -117,8 +111,9 @@ def build_market_context(symbol: str) -> Dict[str, Any]:
         "ask": book["ask"],
         "spread_pct": book["spread_pct"],
         "volume_24h_usdt": safe_float(ticker.get("quoteVolume")),
-        "funding_rate_pct": funding_rate,
-        "funding_rate_available": funding_available,
+        "funding_rate_pct": binance.get_funding_rate(symbol),
+        "open_interest": open_interest,
+        "open_interest_change_pct": 0.0,
         "tf": {
             "1H": tf_1h,
             "4H": tf_4h,
