@@ -39,6 +39,12 @@ class TradeConfig:
     TRAIL_AFTER_R: float = _get_float("TRAIL_AFTER_R", "1.5")
     PARTIAL_TP_AT_R: float = _get_float("PARTIAL_TP_AT_R", "1.0")
     PARTIAL_CLOSE_RATIO: float = _get_float("PARTIAL_CLOSE_RATIO", "0.40")
+    DEAD_TRADE_MAX_DEVIATION_PCT: float = _get_float("DEAD_TRADE_MAX_DEVIATION_PCT", "1.0")
+    BREAKOUT_CONFIRM_PCT: float = _get_float("BREAKOUT_CONFIRM_PCT", "0.12")
+    MAX_NEW_ORDERS_PER_SCAN: int = _get_int("MAX_NEW_ORDERS_PER_SCAN", "1")
+    ORDER_COOLDOWN_MINUTES: int = _get_int("ORDER_COOLDOWN_MINUTES", "240")
+    LIMIT_ENTRY_SLIPPAGE_PCT: float = _get_float("LIMIT_ENTRY_SLIPPAGE_PCT", "0.0")
+    MARKET_ENTRY_SLIPPAGE_PCT: float = _get_float("MARKET_ENTRY_SLIPPAGE_PCT", "0.035")
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,8 @@ class FilterConfig:
     MAX_SPREAD_PCT: float = _get_float("MAX_SPREAD_PCT", "0.15")
     MIN_EXPECTED_NET_PNL_PCT: float = _get_float("MIN_EXPECTED_NET_PNL_PCT", "1.40")
     MAX_FUNDING_RATE_PCT: float = _get_float("MAX_FUNDING_RATE_PCT", "0.05")
+    MIN_ADAPTIVE_EXPECTANCY: float = _get_float("MIN_ADAPTIVE_EXPECTANCY", "0.0")
+    STRICT_EXPECTANCY_BLOCK: bool = _get_bool("STRICT_EXPECTANCY_BLOCK", "1")
 
 
 @dataclass(frozen=True)

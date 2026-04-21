@@ -86,6 +86,8 @@ def build_position_from_filled_order(order: Dict[str, Any]) -> Optional[Dict[str
         "lowest_price": entry,
         "initial_qty": qty,
         "initial_risk": initial_risk,
+        "news_alignment": order.get("news_alignment", "unknown"),
+        "news_tp_policy": order.get("news_tp_policy", "default"),
     }
 
 
@@ -303,7 +305,11 @@ def maybe_trail_stop(position: Dict[str, Any]) -> Dict[str, Any]:
         live_price=safe_float(position["live_price"]),
         side=position["side"],
     )
-    if progress_r < CONFIG.TRADE.TRAIL_AFTER_R:
+    trail_after_r = CONFIG.TRADE.TRAIL_AFTER_R
+    if str(position.get("news_tp_policy", "")) == "widen_or_trail":
+        trail_after_r = max(1.0, trail_after_r - 0.5)
+
+    if progress_r < trail_after_r:
         return position
 
     initial_risk_per_unit = abs(entry - safe_float(position.get("sl")))

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import csv
 import os
@@ -250,6 +250,10 @@ def _plan_to_candidate(
     size_mult = safe_float(plan.get("size_mult", 1.0), 1.0)
     scenario_probability = safe_float(plan.get("scenario_probability", 0.0))
 
+    preferred_order_type = str(plan.get("preferred_order_type") or "").upper()
+    if preferred_order_type not in {"LIMIT", "MARKET"}:
+        preferred_order_type = "LIMIT" if CONFIG.TRADE.USE_LIMIT_ENTRY else "MARKET"
+
     return {
         "order_id": make_order_id(),
         "client_order_id": "",
@@ -265,6 +269,7 @@ def _plan_to_candidate(
         "tf_context": build_tf_context(market_ctx),
         "setup_type": setup_type,
         "setup_reason": setup_reason,
+        "setup_family": str(plan.get("setup_family") or ""),
         "scenario_name": str(plan.get("scenario_name", "")),
         "scenario_probability": scenario_probability,
         "size_mult": size_mult,
@@ -275,7 +280,7 @@ def _plan_to_candidate(
         "live_price": last_price,
         "exchange_order_id": "",
         "exchange_status": "",
-        "order_type": "LIMIT" if CONFIG.TRADE.USE_LIMIT_ENTRY else "MARKET",
+        "order_type": preferred_order_type,
         "submitted_qty": 0.0,
         "executed_qty": 0.0,
         "avg_fill_price": 0.0,
@@ -288,6 +293,7 @@ def _plan_to_candidate(
         "volume_24h_usdt": market_ctx["volume_24h_usdt"],
         "spread_pct": market_ctx["spread_pct"],
         "funding_rate_pct": market_ctx["funding_rate_pct"],
+        "funding_rate_available": market_ctx.get("funding_rate_available", 1),
         "adaptive_score_delta": 0,
         "adaptive_expectancy": 0.0,
         "adaptive_sample_size": 0,
@@ -351,7 +357,12 @@ def estimate_expected_net_pnl_pct(candidate: Dict[str, Any]) -> float:
         return 0.0
 
     gross = abs(tp - entry) / entry * 100.0
-    rough_fees_slippage = spread_pct + 0.15
+    if normalize_status(candidate.get("order_type")) == "LIMIT":
+        slippage_pct = CONFIG.TRADE.LIMIT_ENTRY_SLIPPAGE_PCT
+    else:
+        slippage_pct = CONFIG.TRADE.MARKET_ENTRY_SLIPPAGE_PCT
+
+    rough_fees_slippage = spread_pct + 0.08 + slippage_pct
     return gross - rough_fees_slippage
 
 
@@ -364,21 +375,49 @@ def estimate_stop_net_loss_pct(candidate: Dict[str, Any]) -> float:
         return 0.0
 
     gross_loss = abs(entry - sl) / entry * 100.0
-    return gross_loss + spread_pct + 0.15
+    if normalize_status(candidate.get("order_type")) == "LIMIT":
+        slippage_pct = CONFIG.TRADE.LIMIT_ENTRY_SLIPPAGE_PCT
+    else:
+        slippage_pct = CONFIG.TRADE.MARKET_ENTRY_SLIPPAGE_PCT
+
+    return gross_loss + spread_pct + 0.08 + slippage_pct
+
+
+def _is_trend_setup(candidate: Dict[str, Any]) -> bool:
+    setup_reason = normalize_status(candidate.get("setup_reason"))
+    setup_family = normalize_status(candidate.get("setup_family"))
+    if setup_family == "TREND":
+        return True
+    return any(x in setup_reason for x in {"TREND_", "BREAKOUT", "BREAKDOWN", "PULLBACK"})
+
+
+def _is_ranging_context(candidate: Dict[str, Any]) -> bool:
+    tf_context = str(candidate.get("tf_context", ""))
+    return ("1H=RANGE" in tf_context) and ("4H=RANGE" in tf_context)
 
 
 def passes_order_filters(candidate: Dict[str, Any]) -> Tuple[bool, str]:
     if candidate["score"] < CONFIG.FILTER.MIN_SCORE:
         return False, "LOW_SCORE"
+    if _is_trend_setup(candidate) and _is_ranging_context(candidate):
+        return False, "TREND_DISABLED_IN_RANGE"
     if int(candidate.get("adaptive_blocked", 0)) == 1:
         return False, "ADAPTIVE_BLOCKED"
+    adaptive_sample = int(candidate.get("adaptive_sample_size", 0))
+    adaptive_expectancy = safe_float(candidate.get("adaptive_expectancy"))
+    if (
+        CONFIG.FILTER.STRICT_EXPECTANCY_BLOCK
+        and adaptive_sample > 0
+        and adaptive_expectancy < CONFIG.FILTER.MIN_ADAPTIVE_EXPECTANCY
+    ):
+        return False, "NEGATIVE_EXPECTANCY_SETUP"
     if safe_float(candidate["rr"]) < CONFIG.FILTER.MIN_RR:
         return False, "LOW_RR"
     if safe_float(candidate["volume_24h_usdt"]) < CONFIG.FILTER.MIN_24H_VOLUME_USDT:
         return False, "LOW_VOLUME"
     if safe_float(candidate["spread_pct"]) > CONFIG.FILTER.MAX_SPREAD_PCT:
         return False, "HIGH_SPREAD"
-    if abs(safe_float(candidate["funding_rate_pct"])) > CONFIG.FILTER.MAX_FUNDING_RATE_PCT:
+    if int(safe_float(candidate.get("funding_rate_available", 1), 1.0)) == 1 and abs(safe_float(candidate["funding_rate_pct"])) > CONFIG.FILTER.MAX_FUNDING_RATE_PCT:
         return False, "FUNDING_TOO_HIGH"
     if safe_float(candidate["expected_net_pnl_pct"]) < CONFIG.FILTER.MIN_EXPECTED_NET_PNL_PCT:
         return False, "LOW_EXPECTED_NET_PNL"
@@ -778,6 +817,27 @@ def update_virtual_order_market_state(order: Dict[str, Any], market_ctx: Dict[st
     if near_trigger(order, live_price):
         order["alarm_near_trigger_sent"] = order.get("alarm_near_trigger_sent", 0)
 
+    trigger = safe_float(order.get("entry_trigger"))
+    if trigger > 0:
+        drift_pct = abs(live_price - trigger) / trigger * 100.0
+        if drift_pct > CONFIG.TRADE.DEAD_TRADE_MAX_DEVIATION_PCT and get_order_status(order) in {"WATCHING", "PLANNED", "READY", "NEW"}:
+            order["status"] = "CANCELLED"
+            order["exchange_status"] = "DEAD_TRADE_KILLER"
+            order["close_reason"] = "DEAD_TRADE_KILLER"
+            order["drift_pct"] = drift_pct
+            return stamp_updated(order)
+
+    order_type = normalize_status(order.get("order_type"))
+    if order_type == "MARKET" and get_order_status(order) in {"WATCHING", "PLANNED"}:
+        side = normalize_status(order.get("side"))
+        confirm_pct = CONFIG.TRADE.BREAKOUT_CONFIRM_PCT / 100.0
+        tf_1h = market_ctx.get("tf", {}).get("1H", {})
+        ema20 = safe_float(tf_1h.get("ema20"))
+        if side == "LONG" and live_price >= trigger * (1 + confirm_pct) and (ema20 <= 0 or live_price >= ema20):
+            order["status"] = "READY"
+        elif side == "SHORT" and live_price <= trigger * (1 - confirm_pct) and (ema20 <= 0 or live_price <= ema20):
+            order["status"] = "READY"
+
     return stamp_updated(order)
 
 
@@ -813,17 +873,18 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
     order["executed_qty"] = 0.0
     order["avg_fill_price"] = 0.0
 
-    should_fill = False
-    if side == "LONG" and live_price <= trigger:
-        should_fill = True
-    elif side == "SHORT" and live_price >= trigger:
-        should_fill = True
+    should_fill = normalize_status(order.get("order_type")) == "MARKET"
+    if not should_fill:
+        if side == "LONG" and live_price <= trigger:
+            should_fill = True
+        elif side == "SHORT" and live_price >= trigger:
+            should_fill = True
 
     if should_fill:
         order["status"] = "FILLED"
         order["exchange_status"] = "PAPER_FILLED"
         order["executed_qty"] = safe_float(order.get("submitted_qty"))
-        order["avg_fill_price"] = trigger
+        order["avg_fill_price"] = live_price if normalize_status(order.get("order_type")) == "MARKET" else trigger
 
     return stamp_updated(order)
 
@@ -838,6 +899,11 @@ def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tu
         symbol_meta=symbol_meta,
     )
     size_mult = safe_float(order.get("size_mult", 1.0), 1.0)
+    score = safe_float(order.get("score"))
+    score_mult = 0.70 + min(0.60, max(0.0, (score - CONFIG.FILTER.MIN_SCORE) * 0.06))
+    expectancy = safe_float(order.get("adaptive_expectancy"))
+    expectancy_mult = 1.0 + min(0.35, max(-0.40, expectancy * 0.25))
+    size_mult *= max(0.25, score_mult * expectancy_mult)
     if size_mult > 0:
         qty *= size_mult
     if qty <= 0:
@@ -940,6 +1006,14 @@ def maybe_create_virtual_order(
     candidate["expected_net_pnl_pct"] = estimate_expected_net_pnl_pct(candidate)
     candidate["stop_net_loss_pct"] = estimate_stop_net_loss_pct(candidate)
     candidate = _apply_learning_layers(candidate, optimizer_weights=optimizer_weights)
+    if int(candidate.get("adaptive_sample_size", 0)) > 0 and safe_float(candidate.get("adaptive_expectancy")) < 0:
+        log.info(
+            "ORDER_SKIP_NEG_EXPECTANCY %s expectancy=%s sample=%s",
+            symbol,
+            candidate.get("adaptive_expectancy", 0.0),
+            candidate.get("adaptive_sample_size", 0),
+        )
+        return None
 
     if int(candidate.get("adaptive_blocked", 0)) == 1:
         log.info(
@@ -1002,6 +1076,38 @@ def get_order_age_minutes(order: Dict[str, Any]) -> float:
         return (now - dt).total_seconds() / 60.0
     except Exception:
         return 0.0
+
+
+def _parse_utc(raw: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _symbol_is_on_cooldown(symbol: str) -> bool:
+    cooldown_min = max(0, int(CONFIG.TRADE.ORDER_COOLDOWN_MINUTES))
+    if cooldown_min <= 0:
+        return False
+    path = CONFIG.FILES.CLOSED_ORDERS_CSV
+    if not os.path.exists(path):
+        return False
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=cooldown_min)
+    try:
+        with open(path, "r", newline="") as f:
+            for row in reversed(list(csv.DictReader(f))):
+                if row.get("symbol") != symbol:
+                    continue
+                closed_at = _parse_utc(row.get("closed_at", ""))
+                if closed_at and closed_at >= cutoff:
+                    return True
+                if closed_at:
+                    return False
+    except Exception:
+        return False
+    return False
 
 
 def process_existing_order(
@@ -1096,8 +1202,15 @@ def scan_once() -> None:
         if normalize_status(p.get("status")) == "OPEN_POSITION"
     }
 
+    created_this_scan = 0
+    max_new_per_scan = max(1, CONFIG.TRADE.MAX_NEW_ORDERS_PER_SCAN)
+
     for symbol in symbols:
+        if created_this_scan >= max_new_per_scan:
+            break
         if symbol in active_symbols or symbol in position_symbols:
+            continue
+        if _symbol_is_on_cooldown(symbol):
             continue
 
         try:
@@ -1129,6 +1242,7 @@ def scan_once() -> None:
             )
             refreshed_active_orders.append(new_order)
             updated_orders.append(new_order)
+            created_this_scan += 1
 
     deduped_open, duplicate_closed = cleanup_duplicate_open_orders(updated_orders)
     storage.save_open_orders(deduped_open)

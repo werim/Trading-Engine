@@ -80,19 +80,28 @@ def build_order_plan(
             size_mult = 1.0
             setup_type = "REGIME_SCENARIO"
             setup_reason = name
+            setup_family = "TREND"
+            preferred_order_type = "LIMIT"
 
             if name in {"TREND_CONTINUATION_LONG", "TREND_CONTINUATION_SHORT"}:
                 score_bonus += 4
                 size_mult = 1.0
+                setup_type = "REGIME_SCENARIO"
+                preferred_order_type = "MARKET"
             elif name in {"BREAKOUT_LONG", "BREAKDOWN_SHORT"}:
                 score_bonus += 3
                 size_mult = 0.90
+                setup_type = "REGIME_SCENARIO"
+                preferred_order_type = "MARKET"
             elif name in {"PULLBACK_LONG", "PULLBACK_SHORT"}:
                 score_bonus += 2
                 size_mult = 0.80
+                setup_type = "PULLBACK"
             elif name in {"RANGE_LOWER_BOUNCE", "RANGE_UPPER_REJECT"}:
                 score_bonus += 0
                 size_mult = 0.45
+                setup_type = "RANGE_PULLBACK"
+                setup_family = "RANGE"
             else:
                 continue
 
@@ -130,6 +139,8 @@ def build_order_plan(
                 "rr": rr,
                 "setup_type": setup_type,
                 "setup_reason": setup_reason,
+                "setup_family": setup_family,
+                "preferred_order_type": preferred_order_type,
                 "scenario_name": name,
                 "scenario_probability": prob,
                 "score_bonus": score_bonus,

@@ -23,3 +23,18 @@ bash ./restart.sh
 ## Log izleme
 tail -f logs/order.log
 tail -f logs/position.log
+
+## News/Sentiment Backtest
+Post-news fiyat davranış analizi için:
+
+```bash
+python3 news_backtest.py \
+  --symbols BTCUSDT,ETHUSDT \
+  --start 2025-01-01T00:00:00Z \
+  --end 2025-03-01T00:00:00Z \
+  --events-csv data/news_backtest/events_raw.csv \
+  --output-dir data/news_backtest
+```
+
+Üretilen `data/news_backtest/news_stats.json` ve `events_enriched.json` dosyaları order engine içinde
+filtre + TP yönetim katmanında kullanılır. Veri yoksa trade akışı bloklanmaz.

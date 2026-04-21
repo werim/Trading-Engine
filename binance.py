@@ -375,6 +375,11 @@ def get_funding_rate(symbol: str) -> float:
     return safe_float(rows[0].get("fundingRate")) * 100.0
 
 
+def get_open_interest(symbol: str) -> float:
+    data = _request("GET", "/fapi/v1/openInterest", {"symbol": symbol})
+    return safe_float(data.get("openInterest"))
+
+
 def get_top_symbols_by_volume(limit: int = 100, quote: str = "USDT") -> List[str]:
     rows = _request("GET", "/fapi/v1/ticker/24hr")
     enriched = []

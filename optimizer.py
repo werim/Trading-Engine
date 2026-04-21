@@ -196,7 +196,11 @@ def _score_delta_from_bucket(bucket: Dict[str, Any], min_sample: int = DEFAULT_M
     blocked = False
     reason = "NEUTRAL"
 
-    if trades >= block_sample and (expectancy <= -0.80 or sl_rate >= 0.72):
+    if trades >= min_sample and expectancy < 0:
+        delta = -max_delta
+        blocked = True
+        reason = "BLOCK_NEGATIVE_EXPECTANCY"
+    elif trades >= block_sample and (expectancy <= -0.80 or sl_rate >= 0.72):
         delta = -max_delta
         blocked = True
         reason = "BLOCK_BAD_SETUP"
@@ -357,12 +361,21 @@ def compute_candidate_adjustment(candidate: Dict[str, Any], weights: Dict[str, A
             "adaptive_reason": "NO_OPTIMIZER_DATA",
         }
 
+    adaptive_expectancy = float(row.get("adaptive_expectancy", 0.0))
+    adaptive_sample_size = int(row.get("adaptive_sample_size", 0))
+    adaptive_blocked = bool(row.get("adaptive_blocked", False))
+    adaptive_reason = str(row.get("adaptive_reason", "OPTIMIZED"))
+
+    if adaptive_sample_size > 0 and adaptive_expectancy < 0:
+        adaptive_blocked = True
+        adaptive_reason = "BLOCK_NEGATIVE_EXPECTANCY"
+
     return {
         "adaptive_score_delta": int(row.get("adaptive_score_delta", 0)),
-        "adaptive_expectancy": float(row.get("adaptive_expectancy", 0.0)),
-        "adaptive_sample_size": int(row.get("adaptive_sample_size", 0)),
-        "adaptive_blocked": bool(row.get("adaptive_blocked", False)),
-        "adaptive_reason": str(row.get("adaptive_reason", "OPTIMIZED")),
+        "adaptive_expectancy": adaptive_expectancy,
+        "adaptive_sample_size": adaptive_sample_size,
+        "adaptive_blocked": adaptive_blocked,
+        "adaptive_reason": adaptive_reason,
     }
 
 

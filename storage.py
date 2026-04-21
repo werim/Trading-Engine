@@ -50,6 +50,12 @@ OPEN_ORDER_FIELDS = [
     "volume_24h_usdt",
     "spread_pct",
     "funding_rate_pct",
+    "news_data_available",
+    "news_score_delta",
+    "news_blocked",
+    "news_block_reason",
+    "news_alignment",
+    "news_tp_policy",
 ]
 
 OPEN_POSITION_FIELDS = [
@@ -84,6 +90,8 @@ OPEN_POSITION_FIELDS = [
     "lowest_price",
     "initial_qty",
     "initial_risk",
+    "news_alignment",
+    "news_tp_policy",
 ]
 
 CLOSED_POSITION_FIELDS = OPEN_POSITION_FIELDS + [
