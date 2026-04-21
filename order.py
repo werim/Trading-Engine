@@ -54,6 +54,32 @@ EXCHANGE_TO_LOCAL_STATUS = {
     "REJECTED": "REJECTED",
 }
 
+BAD_EVENT_TYPES = {
+    "volume_spike",
+    "volatility_burst",
+}
+
+A_PLUS_EVENT_KEYS = {
+    ("price_spike_up", "normal", "sharp_up"),
+    ("combined_shock", "high", "mild"),
+    ("combined_shock", "high", "sharp_up"),
+}
+
+SUPPORTIVE_EVENT_KEYS = {
+    ("combined_shock", "extreme", "mild"),
+    ("combined_shock", "extreme", "sharp_up"),
+    ("price_spike_up", "normal", "mild"),
+    ("price_spike_down", "normal", "sharp_down"),
+}
+
+MIN_EVENT_SAMPLE_SIZE = 10
+MIN_EVENT_WINRATE = 0.60
+A_PLUS_TP_MULT = 1.18
+SUPPORTIVE_TP_MULT = 1.08
+EVENT_SCORE_BONUS_A_PLUS = 4
+EVENT_SCORE_BONUS_SUPPORTIVE = 2
+EVENT_SCORE_PENALTY_BAD = -4
+
 log = get_logger("order", "logs/order.log")
 
 
@@ -87,10 +113,137 @@ def build_tf_context(market_ctx: Dict[str, Any]) -> str:
     return f"1H={tf['1H']['regime']}|4H={tf['4H']['regime']}|1D={tf['1D']['regime']}"
 
 
+def _normalize_event_type(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_bucket(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _market_event_key(event: Dict[str, Any]) -> Tuple[str, str, str]:
+    return (
+        _normalize_event_type(event.get("event_type")),
+        _normalize_bucket(event.get("volume_bucket")),
+        _normalize_bucket(event.get("return_bucket")),
+    )
+
+
+def _extract_market_event(market_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    raw = market_ctx.get("market_event") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    return {
+        "event_type": _normalize_event_type(raw.get("event_type")),
+        "direction": normalize_status(raw.get("direction")),
+        "volume_bucket": _normalize_bucket(raw.get("volume_bucket")),
+        "return_bucket": _normalize_bucket(raw.get("return_bucket")),
+        "winrate": safe_float(raw.get("winrate", 0.0)),
+        "sample_size": int(safe_float(raw.get("sample_size", 0))),
+        "recent": int(safe_float(raw.get("recent", 0))),
+    }
+
+
+def _candidate_side_matches_event(candidate: Dict[str, Any], event: Dict[str, Any]) -> bool:
+    side = normalize_status(candidate.get("side"))
+    direction = normalize_status(event.get("direction"))
+
+    if not direction or direction == "NEUTRAL":
+        return True
+    if side == "LONG" and direction == "UP":
+        return True
+    if side == "SHORT" and direction == "DOWN":
+        return True
+    return False
+
+
+def _apply_tp_multiplier(candidate: Dict[str, Any], tp_mult: float) -> Dict[str, Any]:
+    entry = safe_float(candidate.get("entry_trigger"))
+    tp = safe_float(candidate.get("tp"))
+    side = normalize_status(candidate.get("side"))
+
+    if entry <= 0 or tp <= 0 or tp_mult <= 0:
+        return candidate
+
+    if side == "LONG":
+        dist = max(tp - entry, 0.0)
+        candidate["tp"] = entry + dist * tp_mult
+    elif side == "SHORT":
+        dist = max(entry - tp, 0.0)
+        candidate["tp"] = entry - dist * tp_mult
+
+    candidate["rr"] = calc_rr(
+        safe_float(candidate["entry_trigger"]),
+        safe_float(candidate["sl"]),
+        safe_float(candidate["tp"]),
+        side,
+    )
+    return candidate
+
+
+def _apply_market_event_intelligence(candidate: Dict[str, Any], market_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    event = _extract_market_event(market_ctx)
+    event_key = _market_event_key(event)
+
+    candidate["market_event_type"] = event.get("event_type", "")
+    candidate["market_event_direction"] = event.get("direction", "")
+    candidate["market_event_volume_bucket"] = event.get("volume_bucket", "")
+    candidate["market_event_return_bucket"] = event.get("return_bucket", "")
+    candidate["market_event_winrate"] = event.get("winrate", 0.0)
+    candidate["market_event_sample_size"] = event.get("sample_size", 0)
+    candidate["market_event_recent"] = event.get("recent", 0)
+    candidate["market_event_key"] = "|".join(event_key)
+    candidate["market_event_blocked"] = 0
+    candidate["market_event_reason"] = ""
+
+    if not event.get("event_type"):
+        candidate["market_event_reason"] = "NO_EVENT"
+        return candidate
+
+    if event.get("recent", 0) != 1:
+        candidate["market_event_reason"] = "STALE_EVENT"
+        return candidate
+
+    if not _candidate_side_matches_event(candidate, event):
+        candidate["market_event_blocked"] = 1
+        candidate["market_event_reason"] = "EVENT_DIRECTION_MISMATCH"
+        return candidate
+
+    if event["event_type"] in BAD_EVENT_TYPES:
+        candidate["market_event_blocked"] = 1
+        candidate["market_event_reason"] = "BAD_EVENT_TYPE"
+        candidate["score"] = max(0, int(candidate.get("score", 0)) + EVENT_SCORE_PENALTY_BAD)
+        return candidate
+
+    if event["sample_size"] < MIN_EVENT_SAMPLE_SIZE:
+        candidate["market_event_reason"] = "LOW_EVENT_SAMPLE"
+        return candidate
+
+    if event["winrate"] < MIN_EVENT_WINRATE:
+        candidate["market_event_blocked"] = 1
+        candidate["market_event_reason"] = "LOW_EVENT_WINRATE"
+        return candidate
+
+    if event_key in A_PLUS_EVENT_KEYS:
+        candidate["score"] = int(candidate.get("score", 0)) + EVENT_SCORE_BONUS_A_PLUS
+        candidate["market_event_reason"] = "A_PLUS_EVENT"
+        candidate = _apply_tp_multiplier(candidate, A_PLUS_TP_MULT)
+        return candidate
+
+    if event_key in SUPPORTIVE_EVENT_KEYS:
+        candidate["score"] = int(candidate.get("score", 0)) + EVENT_SCORE_BONUS_SUPPORTIVE
+        candidate["market_event_reason"] = "SUPPORTIVE_EVENT"
+        candidate = _apply_tp_multiplier(candidate, SUPPORTIVE_TP_MULT)
+        return candidate
+
+    candidate["market_event_reason"] = "UNSUPPORTED_EVENT"
+    return candidate
+
+
 # ============================================================================
 # candidate building
 # ============================================================================
-
 
 def _build_fallback_order_candidate(symbol: str, market_ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     tf = market_ctx["tf"]
@@ -136,6 +289,7 @@ def _build_fallback_order_candidate(symbol: str, market_ctx: Dict[str, Any]) -> 
 
     else:
         return None
+
     distance_pct = abs(last_price - entry_trigger) / last_price * 100.0
     if distance_pct > 3.0:
         return None
@@ -185,6 +339,16 @@ def _build_fallback_order_candidate(symbol: str, market_ctx: Dict[str, Any]) -> 
         "adaptive_sample_size": 0,
         "adaptive_reason": "",
         "adaptive_blocked": 0,
+        "market_event_type": "",
+        "market_event_direction": "",
+        "market_event_volume_bucket": "",
+        "market_event_return_bucket": "",
+        "market_event_winrate": 0.0,
+        "market_event_sample_size": 0,
+        "market_event_recent": 0,
+        "market_event_key": "",
+        "market_event_blocked": 0,
+        "market_event_reason": "",
     }
 
 
@@ -299,6 +463,16 @@ def _plan_to_candidate(
         "adaptive_sample_size": 0,
         "adaptive_reason": "",
         "adaptive_blocked": 0,
+        "market_event_type": "",
+        "market_event_direction": "",
+        "market_event_volume_bucket": "",
+        "market_event_return_bucket": "",
+        "market_event_winrate": 0.0,
+        "market_event_sample_size": 0,
+        "market_event_recent": 0,
+        "market_event_key": "",
+        "market_event_blocked": 0,
+        "market_event_reason": "",
     }
 
 
@@ -345,7 +519,14 @@ def score_candidate(candidate: Dict[str, Any], market_ctx: Dict[str, Any]) -> in
     if safe_float(market_ctx["spread_pct"]) <= CONFIG.FILTER.MAX_SPREAD_PCT:
         score += 1
 
-    return score
+    setup_reason = normalize_status(candidate.get("setup_reason"))
+    if "BREAKOUT" in setup_reason or "TREND_CONTINUATION" in setup_reason:
+        score += 1
+
+    if "PULLBACK" in setup_reason and tf["1H"]["regime"] == "RANGE":
+        score -= 2
+
+    return max(0, score)
 
 
 def estimate_expected_net_pnl_pct(candidate: Dict[str, Any]) -> float:
@@ -399,28 +580,50 @@ def _is_ranging_context(candidate: Dict[str, Any]) -> bool:
 def passes_order_filters(candidate: Dict[str, Any]) -> Tuple[bool, str]:
     if candidate["score"] < CONFIG.FILTER.MIN_SCORE:
         return False, "LOW_SCORE"
+
     if _is_trend_setup(candidate) and _is_ranging_context(candidate):
         return False, "TREND_DISABLED_IN_RANGE"
+
     if int(candidate.get("adaptive_blocked", 0)) == 1:
         return False, "ADAPTIVE_BLOCKED"
+
+    if int(candidate.get("market_event_blocked", 0)) == 1:
+        return False, str(candidate.get("market_event_reason") or "MARKET_EVENT_BLOCKED")
+
     adaptive_sample = int(candidate.get("adaptive_sample_size", 0))
     adaptive_expectancy = safe_float(candidate.get("adaptive_expectancy"))
+
     if (
         CONFIG.FILTER.STRICT_EXPECTANCY_BLOCK
         and adaptive_sample > 0
         and adaptive_expectancy < CONFIG.FILTER.MIN_ADAPTIVE_EXPECTANCY
     ):
         return False, "NEGATIVE_EXPECTANCY_SETUP"
+
     if safe_float(candidate["rr"]) < CONFIG.FILTER.MIN_RR:
         return False, "LOW_RR"
+
     if safe_float(candidate["volume_24h_usdt"]) < CONFIG.FILTER.MIN_24H_VOLUME_USDT:
         return False, "LOW_VOLUME"
+
     if safe_float(candidate["spread_pct"]) > CONFIG.FILTER.MAX_SPREAD_PCT:
         return False, "HIGH_SPREAD"
-    if int(safe_float(candidate.get("funding_rate_available", 1), 1.0)) == 1 and abs(safe_float(candidate["funding_rate_pct"])) > CONFIG.FILTER.MAX_FUNDING_RATE_PCT:
+
+    if (
+        int(safe_float(candidate.get("funding_rate_available", 1), 1.0)) == 1
+        and abs(safe_float(candidate["funding_rate_pct"])) > CONFIG.FILTER.MAX_FUNDING_RATE_PCT
+    ):
         return False, "FUNDING_TOO_HIGH"
+
     if safe_float(candidate["expected_net_pnl_pct"]) < CONFIG.FILTER.MIN_EXPECTED_NET_PNL_PCT:
         return False, "LOW_EXPECTED_NET_PNL"
+
+    order_type = normalize_status(candidate.get("order_type"))
+    event_reason = str(candidate.get("market_event_reason", ""))
+
+    if order_type == "MARKET" and event_reason not in {"A_PLUS_EVENT", "SUPPORTIVE_EVENT"}:
+        return False, "MARKET_ORDER_WITHOUT_EVENT_CONFIRMATION"
+
     return True, "OK"
 
 
@@ -1005,7 +1208,13 @@ def maybe_create_virtual_order(
     candidate["score"] = score_candidate(candidate, market_ctx)
     candidate["expected_net_pnl_pct"] = estimate_expected_net_pnl_pct(candidate)
     candidate["stop_net_loss_pct"] = estimate_stop_net_loss_pct(candidate)
+
     candidate = _apply_learning_layers(candidate, optimizer_weights=optimizer_weights)
+    candidate = _apply_market_event_intelligence(candidate, market_ctx)
+
+    candidate["expected_net_pnl_pct"] = estimate_expected_net_pnl_pct(candidate)
+    candidate["stop_net_loss_pct"] = estimate_stop_net_loss_pct(candidate)
+
     if int(candidate.get("adaptive_sample_size", 0)) > 0 and safe_float(candidate.get("adaptive_expectancy")) < 0:
         log.info(
             "ORDER_SKIP_NEG_EXPECTANCY %s expectancy=%s sample=%s",
@@ -1028,13 +1237,16 @@ def maybe_create_virtual_order(
     ok, reason = passes_order_filters(candidate)
     if not ok:
         log.info(
-            "ORDER_SKIP_FILTER %s %s score=%s delta=%s exp=%s samples=%s",
+            "ORDER_SKIP_FILTER %s %s score=%s delta=%s exp=%s samples=%s event=%s event_wr=%s event_n=%s",
             symbol,
             reason,
             candidate.get("score", 0),
             candidate.get("adaptive_score_delta", 0),
             candidate.get("adaptive_expectancy", 0.0),
             candidate.get("adaptive_sample_size", 0),
+            candidate.get("market_event_key", ""),
+            candidate.get("market_event_winrate", 0.0),
+            candidate.get("market_event_sample_size", 0),
         )
         return None
 
@@ -1121,12 +1333,19 @@ def process_existing_order(
 
     order = update_virtual_order_market_state(order, market_ctx)
 
-    # ⏳ STALE WATCHING ORDER CLEANUP
+    current_event = _extract_market_event(market_ctx)
+    if get_order_status(order) in {"WATCHING", "PLANNED", "READY"}:
+        current_event_type = current_event.get("event_type", "")
+        if current_event_type in BAD_EVENT_TYPES:
+            order["status"] = "CANCELLED"
+            order["exchange_status"] = "EVENT_DECAY_CANCEL"
+            order["close_reason"] = "EVENT_DECAY_CANCEL"
+            return stamp_updated(order)
+
     status = get_order_status(order)
 
     if status in {"WATCHING", "PLANNED"}:
         age_min = get_order_age_minutes(order)
-
         if age_min > 240 and int(order.get("zone_touched", 0)) == 0:
             order["status"] = "EXPIRED"
             order["exchange_status"] = "STALE_NO_TOUCH"
@@ -1228,7 +1447,7 @@ def scan_once() -> None:
 
         if new_order:
             log.info(
-                "ORDER_WATCHING_CREATED %s side=%s zone_low=%s zone_high=%s trigger=%s score=%s delta=%s reason=%s expectancy=%s samples=%s",
+                "ORDER_WATCHING_CREATED %s side=%s zone_low=%s zone_high=%s trigger=%s score=%s delta=%s reason=%s expectancy=%s samples=%s event=%s event_wr=%s event_n=%s",
                 new_order["symbol"],
                 new_order["side"],
                 new_order["entry_zone_low"],
@@ -1239,6 +1458,9 @@ def scan_once() -> None:
                 new_order.get("adaptive_reason", ""),
                 new_order.get("adaptive_expectancy", 0.0),
                 new_order.get("adaptive_sample_size", 0),
+                new_order.get("market_event_key", ""),
+                new_order.get("market_event_winrate", 0.0),
+                new_order.get("market_event_sample_size", 0),
             )
             refreshed_active_orders.append(new_order)
             updated_orders.append(new_order)

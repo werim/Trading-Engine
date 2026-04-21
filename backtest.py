@@ -292,6 +292,16 @@ class Backtester:
                 "4H": self._build_tf_snapshot(rows_4h),
                 "1D": self._build_tf_snapshot(rows_1d),
             },
+            "funding_rate_available": 1,
+            "market_event": {
+                "event_type": ...,
+                "direction": ...,
+                "volume_bucket": ...,
+                "return_bucket": ...,
+                "winrate": ...,
+                "sample_size": ...,
+                "recent": 1,
+            }
         }
 
     def _current_decision_rows(self, symbol: str) -> List[Dict[str, Any]]:
