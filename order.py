@@ -1042,6 +1042,21 @@ def near_trigger(order: Dict[str, Any], live_price: float, ratio: float = 0.0015
 def update_virtual_order_market_state(order: Dict[str, Any], market_ctx: Dict[str, Any]) -> Dict[str, Any]:
     live_price = safe_float(market_ctx["last_price"])
     order["live_price"] = live_price
+    status = get_order_status(order)
+    order_type = normalize_status(order.get("order_type"))
+    side = normalize_status(order.get("side"))
+    trigger = safe_float(order.get("entry_trigger"))
+
+    if order_type == "MARKET" and status in {"WATCHING", "PLANNED"} and trigger > 0:
+        confirm_pct = CONFIG.TRADE.BREAKOUT_CONFIRM_PCT / 100.0
+        tf_1h = market_ctx.get("tf", {}).get("1H", {})
+        ema20 = safe_float(tf_1h.get("ema20"))
+        if side == "LONG" and live_price >= trigger * (1 + confirm_pct) and (ema20 <= 0 or live_price >= ema20):
+            order["status"] = "READY"
+            order["watch_reason"] = "BREAKOUT_CONFIRM_LONG"
+        elif side == "SHORT" and live_price <= trigger * (1 - confirm_pct) and (ema20 <= 0 or live_price <= ema20):
+            order["status"] = "READY"
+            order["watch_reason"] = "BREAKOUT_CONFIRM_SHORT"
 
     if zone_is_touched(order, live_price):
         order["zone_touched"] = 1
@@ -1055,29 +1070,37 @@ def update_virtual_order_market_state(order: Dict[str, Any], market_ctx: Dict[st
             order["status"] = "READY"
             order["watch_reason"] = "NEAR_TRIGGER"
 
-    trigger = safe_float(order.get("entry_trigger"))
-    if trigger > 0:
-        drift_pct = abs(live_price - trigger) / trigger * 100.0
-        if drift_pct > CONFIG.TRADE.DEAD_TRADE_MAX_DEVIATION_PCT and get_order_status(order) in {"WATCHING", "PLANNED", "READY", "NEW"}:
-            order["status"] = "CANCELLED"
-            order["exchange_status"] = "DEAD_TRADE_KILLER"
-            order["close_reason"] = "DEAD_TRADE_KILLER"
-            order["drift_pct"] = drift_pct
-            return stamp_updated(order)
+    if _is_pullback_like_order(order) and int(order.get("zone_touched", 0)) == 1 and get_order_status(order) in {"WATCHING", "PLANNED"}:
+        order["status"] = "READY"
+        order["watch_reason"] = "PULLBACK_ZONE_TOUCHED_READY"
 
-    order_type = normalize_status(order.get("order_type"))
-    if order_type == "MARKET" and get_order_status(order) in {"WATCHING", "PLANNED"}:
-        side = normalize_status(order.get("side"))
-        confirm_pct = CONFIG.TRADE.BREAKOUT_CONFIRM_PCT / 100.0
-        tf_1h = market_ctx.get("tf", {}).get("1H", {})
-        ema20 = safe_float(tf_1h.get("ema20"))
-        if side == "LONG" and live_price >= trigger * (1 + confirm_pct) and (ema20 <= 0 or live_price >= ema20):
-            order["status"] = "READY"
-            order["watch_reason"] = "BREAKOUT_CONFIRM_LONG"
-        elif side == "SHORT" and live_price <= trigger * (1 - confirm_pct) and (ema20 <= 0 or live_price <= ema20):
-            order["status"] = "READY"
-            order["watch_reason"] = "BREAKOUT_CONFIRM_SHORT"
-    elif get_order_status(order) in {"WATCHING", "PLANNED"}:
+    if trigger > 0 and get_order_status(order) in {"WATCHING", "PLANNED", "READY", "NEW"}:
+        drift_pct = abs(live_price - trigger) / trigger * 100.0
+        if drift_pct > CONFIG.TRADE.DEAD_TRADE_MAX_DEVIATION_PCT:
+            if _is_breakout_order(order):
+                breakout_continuation = (side == "LONG" and live_price >= trigger) or (side == "SHORT" and live_price <= trigger)
+                if not breakout_continuation:
+                    order["status"] = "CANCELLED"
+                    order["exchange_status"] = "DEAD_TRADE_KILLER"
+                    order["close_reason"] = "DEAD_TRADE_KILLER"
+                    order["drift_pct"] = drift_pct
+                    return stamp_updated(order)
+            else:
+                zone_low = safe_float(order.get("entry_zone_low"))
+                zone_high = safe_float(order.get("entry_zone_high"))
+                ran_away = False
+                if side == "LONG":
+                    ran_away = live_price > max(zone_low, zone_high)
+                elif side == "SHORT":
+                    ran_away = live_price < min(zone_low, zone_high)
+                if ran_away and int(order.get("zone_touched", 0)) == 0:
+                    order["status"] = "CANCELLED"
+                    order["exchange_status"] = "DEAD_TRADE_KILLER"
+                    order["close_reason"] = "DEAD_TRADE_KILLER"
+                    order["drift_pct"] = drift_pct
+                    return stamp_updated(order)
+
+    if get_order_status(order) in {"WATCHING", "PLANNED"}:
         order["watch_reason"] = order.get("watch_reason") or "WAITING_ENTRY_ZONE"
 
     return stamp_updated(order)
@@ -1129,6 +1152,66 @@ def _is_breakout_order(order: Dict[str, Any]) -> bool:
 
 def _is_pullback_like_order(order: Dict[str, Any]) -> bool:
     return not _is_breakout_order(order)
+
+
+def _is_a_plus_order(order: Dict[str, Any]) -> bool:
+    return "A_PLUS" in normalize_status(order.get("market_event_reason"))
+
+
+def _priority_rank(order: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
+    status = get_order_status(order)
+    score = int(safe_float(order.get("score"), 0.0))
+    touched = int(order.get("zone_touched", 0))
+    breakout_confirm = int(_order_entry_type(order) == "BREAKOUT_CONFIRM")
+    a_plus = int(_is_a_plus_order(order))
+    ready = int(status == "READY")
+    return ready, touched, breakout_confirm + a_plus, score, int(_is_breakout_order(order))
+
+
+def _preempt_weaker_orders_if_needed(order: Dict[str, Any], open_orders: List[Dict[str, Any]]) -> int:
+    active_orders = [
+        o for o in open_orders
+        if not is_final_order_status(o.get("status")) and o.get("order_id") != order.get("order_id")
+    ]
+    overflow = (len(active_orders) + 1) - int(CONFIG.TRADE.MAX_OPEN_ORDERS)
+    if overflow <= 0:
+        return 0
+
+    incoming_rank = _priority_rank(order)
+    watchers = []
+    for other in active_orders:
+        status = get_order_status(other)
+        if status not in {"WATCHING", "PLANNED"}:
+            continue
+        if _priority_rank(other) >= incoming_rank:
+            continue
+        age_min = get_order_age_minutes(other)
+        untouched = int(other.get("zone_touched", 0)) == 0
+        stale = age_min >= 60 or untouched
+        if stale:
+            watchers.append((other, age_min, untouched))
+
+    watchers.sort(
+        key=lambda row: (
+            _priority_rank(row[0]),
+            0 if row[2] else 1,
+            -row[1],
+        )
+    )
+
+    cancelled = 0
+    for watcher, age_min, _ in watchers:
+        watcher["status"] = "CANCELLED"
+        watcher["exchange_status"] = "PREEMPTED_BY_READY"
+        watcher["close_reason"] = "PREEMPTED_BY_READY"
+        watcher["preempted_by_order_id"] = order.get("order_id", "")
+        watcher["preempted_by_score"] = safe_float(order.get("score"))
+        watcher["preempted_after_min"] = age_min
+        stamp_updated(watcher)
+        cancelled += 1
+        if cancelled >= overflow:
+            break
+    return cancelled
 
 
 def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
@@ -1244,8 +1327,18 @@ def submit_real_order_from_virtual(order: Dict[str, Any]) -> Dict[str, Any]:
     try:
         resp = _submit_real_exchange_order(order, qty)
     except Exception as exc:
+        log.exception(
+            "ORDER_SUBMIT_ERROR symbol=%s order_id=%s side=%s type=%s qty=%s err=%s",
+            order.get("symbol"),
+            order.get("order_id"),
+            order.get("side"),
+            order.get("order_type"),
+            qty,
+            exc,
+        )
         order["status"] = "FAILED"
-        order["exchange_status"] = f"SUBMIT_ERROR:{type(exc).__name__}"
+        order["exchange_status"] = f"SUBMIT_ERROR:{type(exc).__name__}:{str(exc)}"
+        order["submit_error_detail"] = str(exc)
         return stamp_updated(order)
 
     order["exchange_order_id"] = resp.get("orderId", order.get("exchange_order_id", ""))
@@ -1445,6 +1538,11 @@ def process_existing_order(
 
     if get_order_status(order) == "READY":
         ok, reason = risk.can_open_new_order(order, open_orders, open_positions)
+        if not ok and reason == "MAX_OPEN_ORDERS_REACHED":
+            cancelled = _preempt_weaker_orders_if_needed(order, open_orders)
+            if cancelled > 0:
+                active_after_preempt = [o for o in open_orders if not is_final_order_status(o.get("status"))]
+                ok, reason = risk.can_open_new_order(order, active_after_preempt, open_positions)
         if not ok:
             order["status"] = "CANCELLED"
             order["exchange_status"] = reason
