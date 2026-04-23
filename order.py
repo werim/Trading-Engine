@@ -1247,6 +1247,37 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
     return stamp_updated(order)
 
 
+def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    if CONFIG.ENGINE.EXECUTION_MODE != "PAPER":
+        return order
+    if get_order_status(order) not in {"NEW", "PARTIALLY_FILLED"}:
+        return order
+    if normalize_status(order.get("exchange_status")) == "PAPER_FILLED":
+        return order
+
+    trigger = safe_float(order.get("entry_trigger"))
+    live_price = safe_float(order.get("live_price"))
+    side = normalize_status(order.get("side"))
+    order_type = normalize_status(order.get("order_type"))
+    is_breakout = _is_breakout_order(order)
+
+    should_fill = order_type == "MARKET"
+    if not should_fill:
+        if is_breakout:
+            should_fill = (side == "LONG" and live_price >= trigger) or (side == "SHORT" and live_price <= trigger)
+        else:
+            should_fill = (side == "LONG" and live_price <= trigger) or (side == "SHORT" and live_price >= trigger)
+
+    if not should_fill:
+        return stamp_updated(order)
+
+    order["status"] = "FILLED"
+    order["exchange_status"] = "PAPER_FILLED"
+    order["executed_qty"] = safe_float(order.get("submitted_qty"))
+    order["avg_fill_price"] = live_price if order_type == "MARKET" else trigger
+    return stamp_updated(order)
+
+
 def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tuple[float, Optional[str]]:
     if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
         account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 300.0), 300.0)
@@ -1563,7 +1594,10 @@ def process_existing_order(
         order = submit_real_order_from_virtual(order)
 
     if get_order_status(order) in {"NEW", "PARTIALLY_FILLED"}:
-        order = reconcile_exchange_order_status(order)
+        if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
+            order = _paper_reconcile_pending_order(order)
+        else:
+            order = reconcile_exchange_order_status(order)
 
     return order
 
