@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 import math
+import requests
 
 import binance
+from config import CONFIG
 from utils import safe_float
 
 
@@ -274,6 +276,10 @@ def _detect_market_event_from_1m(symbol: str, klines: List[Dict[str, Any]]) -> D
 
 
 def build_market_context(symbol: str) -> Dict[str, Any]:
+    cached = _get_market_context_from_local_cache(symbol)
+    if cached:
+        return cached
+
     ticker = binance.get_24h_ticker(symbol)
     book = get_book_snapshot(symbol)
     open_interest = binance.get_open_interest(symbol)
@@ -306,4 +312,37 @@ def build_market_context(symbol: str) -> Dict[str, Any]:
 
 
 def get_top_symbols_by_volume(limit: int) -> List[str]:
+    cached_symbols = _get_top_symbols_from_local_cache(limit)
+    if cached_symbols:
+        return cached_symbols
     return binance.get_top_symbols_by_volume(limit)
+
+
+def _cache_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    if not CONFIG.MARKET_DATA.USE_LOCAL_CACHE:
+        return None
+    base = CONFIG.MARKET_DATA.LOCAL_CACHE_BASE_URL.rstrip("/")
+    url = f"{base}{path}"
+    try:
+        resp = requests.get(url, params=params or {}, timeout=CONFIG.MARKET_DATA.LOCAL_CACHE_TIMEOUT_SECONDS)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _get_market_context_from_local_cache(symbol: str) -> Optional[Dict[str, Any]]:
+    payload = _cache_get_json(f"/market-context/{symbol}")
+    if not isinstance(payload, dict):
+        return None
+    if safe_float(payload.get("last_price")) <= 0:
+        return None
+    return payload
+
+
+def _get_top_symbols_from_local_cache(limit: int) -> List[str]:
+    payload = _cache_get_json("/top-symbols", {"limit": limit})
+    if not isinstance(payload, list):
+        return []
+    return [str(x) for x in payload if str(x)]

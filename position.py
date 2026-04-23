@@ -7,6 +7,7 @@ import binance
 import market
 import storage
 from config import CONFIG
+from logger import get_logger
 from notifier import notify_position_closed, notify_position_opened
 from utils import (
     calc_progress_r,
@@ -31,6 +32,8 @@ FINAL_POSITION_STATUSES = {
     "CANCELLED",
 }
 
+log = get_logger("position", "logs/position.log")
+
 
 def opposite_side(position_side: str) -> str:
     return "SELL" if position_side == "LONG" else "BUY"
@@ -49,6 +52,16 @@ def build_position_from_filled_order(order: Dict[str, Any]) -> Optional[Dict[str
     tp = safe_float(order.get("tp"))
 
     if not symbol or not side or entry <= 0 or qty <= 0 or sl <= 0 or tp <= 0:
+        log.info(
+            "POSITION_BUILD_SKIP order_id=%s symbol=%s side=%s entry=%s qty=%s sl=%s tp=%s",
+            order.get("order_id", ""),
+            symbol,
+            side,
+            entry,
+            qty,
+            sl,
+            tp,
+        )
         return None
 
     now = utc_now_str()
@@ -86,6 +99,8 @@ def build_position_from_filled_order(order: Dict[str, Any]) -> Optional[Dict[str
         "lowest_price": entry,
         "initial_qty": qty,
         "initial_risk": initial_risk,
+        "initial_stop_distance": abs(entry - sl),
+        "last_trail_sl": sl,
         "news_alignment": order.get("news_alignment", "unknown"),
         "news_tp_policy": order.get("news_tp_policy", "default"),
     }
@@ -106,9 +121,11 @@ def sync_filled_orders_to_positions() -> None:
 
         position = build_position_from_filled_order(order)
         if not position:
+            log.info("POSITION_SYNC_REJECTED order_id=%s symbol=%s reason=INVALID_FILLED_ORDER", order.get("order_id", ""), order.get("symbol", ""))
             continue
 
         notify_position_opened(position)
+        log.info("POSITION_OPENED order_id=%s position_id=%s symbol=%s qty=%s entry=%s", position["order_id"], position["position_id"], position["symbol"], position["qty"], position["entry"])
         open_positions.append(position)
         existing_order_ids.add(order.get("order_id"))
         changed_positions = True
@@ -267,9 +284,11 @@ def maybe_take_partial(position: Dict[str, Any]) -> Dict[str, Any]:
         return position
 
     position["qty"] = remaining_qty
+    position["realized_partial_qty"] = close_qty
     position["partial_taken"] = 1
     position["status"] = "PARTIAL_TP_DONE"
     position["updated_at"] = utc_now_str()
+    log.info("POSITION_PARTIAL symbol=%s qty_before=%s qty_after=%s close_qty=%s", position["symbol"], current_qty, remaining_qty, close_qty)
     return position
 
 
@@ -290,6 +309,7 @@ def maybe_move_to_break_even(position: Dict[str, Any]) -> Dict[str, Any]:
     position["break_even_armed"] = 1
     position["status"] = "BREAK_EVEN_ARMED"
     position["updated_at"] = utc_now_str()
+    log.info("POSITION_BREAK_EVEN symbol=%s new_sl=%s", position["symbol"], position["sl"])
     return position
 
 
@@ -312,7 +332,7 @@ def maybe_trail_stop(position: Dict[str, Any]) -> Dict[str, Any]:
     if progress_r < trail_after_r:
         return position
 
-    initial_risk_per_unit = abs(entry - safe_float(position.get("sl")))
+    initial_risk_per_unit = safe_float(position.get("initial_stop_distance"))
     if initial_risk_per_unit <= 0:
         initial_risk_per_unit = abs(entry - safe_float(position.get("tp"))) / max(safe_float(position.get("rr")), 1.0)
     if initial_risk_per_unit <= 0:
@@ -329,9 +349,11 @@ def maybe_trail_stop(position: Dict[str, Any]) -> Dict[str, Any]:
         return position
 
     position["sl"] = new_sl
+    position["last_trail_sl"] = new_sl
     position["trailing_active"] = 1
     position["status"] = "TRAILING_ACTIVE"
     position["updated_at"] = utc_now_str()
+    log.info("POSITION_TRAIL symbol=%s old_sl=%s new_sl=%s", position["symbol"], current_sl, new_sl)
     return position
 
 
@@ -361,6 +383,7 @@ def should_close_position(position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def finalize_closed_position(position: Dict[str, Any], close_reason: str, close_price: float) -> None:
     storage.move_open_position_to_closed(position, close_reason, close_price)
     adaptive.record_closed_position(position, close_reason, close_price)
+    log.info("POSITION_CLOSED symbol=%s position_id=%s reason=%s close_price=%s", position.get("symbol", ""), position.get("position_id", ""), close_reason, close_price)
 
 
 def remove_linked_open_order_if_needed(position: Dict[str, Any]) -> None:

@@ -41,19 +41,19 @@ class TradeConfig:
     PARTIAL_CLOSE_RATIO: float = _get_float("PARTIAL_CLOSE_RATIO", "0.40")
     DEAD_TRADE_MAX_DEVIATION_PCT: float = _get_float("DEAD_TRADE_MAX_DEVIATION_PCT", "1.0")
     BREAKOUT_CONFIRM_PCT: float = _get_float("BREAKOUT_CONFIRM_PCT", "0.12")
-    MAX_NEW_ORDERS_PER_SCAN: int = _get_int("MAX_NEW_ORDERS_PER_SCAN", "1")
-    ORDER_COOLDOWN_MINUTES: int = _get_int("ORDER_COOLDOWN_MINUTES", "240")
+    MAX_NEW_ORDERS_PER_SCAN: int = _get_int("MAX_NEW_ORDERS_PER_SCAN", "3")
+    ORDER_COOLDOWN_MINUTES: int = _get_int("ORDER_COOLDOWN_MINUTES", "90")
     LIMIT_ENTRY_SLIPPAGE_PCT: float = _get_float("LIMIT_ENTRY_SLIPPAGE_PCT", "0.0")
     MARKET_ENTRY_SLIPPAGE_PCT: float = _get_float("MARKET_ENTRY_SLIPPAGE_PCT", "0.035")
 
 
 @dataclass(frozen=True)
 class FilterConfig:
-    MIN_SCORE: int = _get_int("MIN_SCORE", "5")
-    MIN_RR: float = _get_float("MIN_RR", "2.7")
+    MIN_SCORE: int = _get_int("MIN_SCORE", "4")
+    MIN_RR: float = _get_float("MIN_RR", "1.6")
     MIN_24H_VOLUME_USDT: float = _get_float("MIN_24H_VOLUME_USDT", "20000000")
     MAX_SPREAD_PCT: float = _get_float("MAX_SPREAD_PCT", "0.15")
-    MIN_EXPECTED_NET_PNL_PCT: float = _get_float("MIN_EXPECTED_NET_PNL_PCT", "1.40")
+    MIN_EXPECTED_NET_PNL_PCT: float = _get_float("MIN_EXPECTED_NET_PNL_PCT", "0.35")
     MAX_FUNDING_RATE_PCT: float = _get_float("MAX_FUNDING_RATE_PCT", "0.05")
     MIN_ADAPTIVE_EXPECTANCY: float = _get_float("MIN_ADAPTIVE_EXPECTANCY", "0.0")
     STRICT_EXPECTANCY_BLOCK: bool = _get_bool("STRICT_EXPECTANCY_BLOCK", "1")
@@ -69,6 +69,13 @@ class StrategyConfig:
     RANGE_PULLBACK_RR_MULT: float = 2.2
     RANGE_BREAKOUT_SL_ATR_MULT: float = 1.1
     RANGE_BREAKOUT_RR_MULT: float = 2.3
+
+
+@dataclass(frozen=True)
+class MarketDataConfig:
+    USE_LOCAL_CACHE: bool = _get_bool("USE_LOCAL_MARKET_CACHE", "1")
+    LOCAL_CACHE_BASE_URL: str = os.getenv("LOCAL_MARKET_CACHE_BASE_URL", "http://127.0.0.1:8000")
+    LOCAL_CACHE_TIMEOUT_SECONDS: float = _get_float("LOCAL_MARKET_CACHE_TIMEOUT_SECONDS", "1.2")
 
 
 @dataclass(frozen=True)
@@ -94,5 +101,6 @@ class CONFIG:
     TRADE = TradeConfig()
     FILTER = FilterConfig()
     STRATEGY = StrategyConfig()
+    MARKET_DATA = MarketDataConfig()
     FILES = FilesConfig()
     TELEGRAM = TelegramConfig()

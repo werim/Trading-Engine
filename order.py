@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+from event_miner import build_event_key, get_event_stats
+from market import _get_market_context_from_local_cache
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import csv
@@ -408,8 +409,16 @@ def _plan_to_candidate(
     if entry_zone_low > entry_zone_high:
         entry_zone_low, entry_zone_high = entry_zone_high, entry_zone_low
 
-    setup_type = str(plan.get("setup_type") or "REGIME_SCENARIO")
     setup_reason = str(plan.get("setup_reason") or plan.get("scenario_name") or f"{side}_SCENARIO")
+    setup_reason_u = normalize_status(setup_reason)
+    if "PULLBACK" in setup_reason_u:
+        setup_type = f"PULLBACK_{side}"
+    elif "RECLAIM" in setup_reason_u:
+        setup_type = f"RECLAIM_{side}"
+    elif "BREAKOUT" in setup_reason_u or "BREAKDOWN" in setup_reason_u:
+        setup_type = f"BREAKOUT_{side}"
+    else:
+        setup_type = str(plan.get("setup_type") or f"RECLAIM_{side}")
     score_bonus = int(safe_float(plan.get("score_bonus", 0)))
     size_mult = safe_float(plan.get("size_mult", 1.0), 1.0)
     scenario_probability = safe_float(plan.get("scenario_probability", 0.0))
@@ -511,9 +520,11 @@ def score_candidate(candidate: Dict[str, Any], market_ctx: Dict[str, Any]) -> in
     if tf["1H"]["regime"] == tf["4H"]["regime"]:
         score += 3
     if tf["4H"]["regime"] == tf["1D"]["regime"]:
-        score += 2
-    if safe_float(candidate["rr"]) >= CONFIG.FILTER.MIN_RR:
         score += 1
+    if tf["1H"]["regime"] != tf["4H"]["regime"] and tf["1H"]["regime"] in {"LONG", "SHORT"} and tf["4H"]["regime"] in {"LONG", "SHORT"}:
+        score += 1
+    if safe_float(candidate["rr"]) >= CONFIG.FILTER.MIN_RR:
+        score += 2
     if safe_float(market_ctx["volume_24h_usdt"]) >= CONFIG.FILTER.MIN_24H_VOLUME_USDT:
         score += 1
     if safe_float(market_ctx["spread_pct"]) <= CONFIG.FILTER.MAX_SPREAD_PCT:
@@ -524,7 +535,7 @@ def score_candidate(candidate: Dict[str, Any], market_ctx: Dict[str, Any]) -> in
         score += 1
 
     if "PULLBACK" in setup_reason and tf["1H"]["regime"] == "RANGE":
-        score -= 2
+        score -= 1
 
     return max(0, score)
 
@@ -578,58 +589,78 @@ def _is_ranging_context(candidate: Dict[str, Any]) -> bool:
 
 
 def passes_order_filters(candidate: Dict[str, Any]) -> Tuple[bool, str]:
-    if candidate["score"] < CONFIG.FILTER.MIN_SCORE:
-        return False, "LOW_SCORE"
+    hard_reasons: List[str] = []
+    score = safe_float(candidate.get("score"))
+
+    rr = safe_float(candidate["rr"])
+    spread_pct = safe_float(candidate["spread_pct"])
+    volume_24h = safe_float(candidate["volume_24h_usdt"])
+    expected_net = safe_float(candidate["expected_net_pnl_pct"])
+    funding_abs = abs(safe_float(candidate["funding_rate_pct"]))
+    entry = safe_float(candidate["entry_trigger"])
+    sl = safe_float(candidate["sl"])
+    tp = safe_float(candidate["tp"])
+    side = normalize_status(candidate.get("side"))
+    stop_pct = (abs(entry - sl) / entry * 100.0) if entry > 0 else 0.0
+    tp_pct = (abs(tp - entry) / entry * 100.0) if entry > 0 else 0.0
+
+    if entry <= 0 or sl <= 0 or tp <= 0:
+        hard_reasons.append("INVALID_GEOMETRY")
+    elif side == "LONG" and not (sl < entry < tp):
+        hard_reasons.append("INVALID_STOP_GEOMETRY")
+    elif side == "SHORT" and not (tp < entry < sl):
+        hard_reasons.append("INVALID_STOP_GEOMETRY")
+
+    if spread_pct > CONFIG.FILTER.MAX_SPREAD_PCT * 1.8:
+        hard_reasons.append("ABSURD_SPREAD")
+    if volume_24h < CONFIG.FILTER.MIN_24H_VOLUME_USDT * 0.45:
+        hard_reasons.append("UNUSABLE_LIQUIDITY")
+    if rr < max(1.05, CONFIG.FILTER.MIN_RR * 0.75):
+        hard_reasons.append("UNUSABLE_RR")
+    if stop_pct < 0.08:
+        hard_reasons.append("STOP_TOO_TIGHT")
+    if stop_pct > 3.8:
+        hard_reasons.append("STOP_TOO_WIDE")
+    if tp_pct < 0.12:
+        hard_reasons.append("TP_TOO_CLOSE")
+
+    if hard_reasons:
+        return False, "|".join(hard_reasons)
 
     if _is_trend_setup(candidate) and _is_ranging_context(candidate):
-        return False, "TREND_DISABLED_IN_RANGE"
-
+        score -= 1.5
     if int(candidate.get("adaptive_blocked", 0)) == 1:
-        return False, "ADAPTIVE_BLOCKED"
-
+        score -= 2
     if int(candidate.get("market_event_blocked", 0)) == 1:
-        return False, str(candidate.get("market_event_reason") or "MARKET_EVENT_BLOCKED")
+        score -= 3
+    if volume_24h < CONFIG.FILTER.MIN_24H_VOLUME_USDT:
+        score -= 1
+    if spread_pct > CONFIG.FILTER.MAX_SPREAD_PCT:
+        score -= 1
+    if funding_abs > CONFIG.FILTER.MAX_FUNDING_RATE_PCT:
+        score -= 1
+    if expected_net < CONFIG.FILTER.MIN_EXPECTED_NET_PNL_PCT:
+        score -= 1
+    if int(candidate.get("adaptive_sample_size", 0)) > 0 and safe_float(candidate.get("adaptive_expectancy")) < CONFIG.FILTER.MIN_ADAPTIVE_EXPECTANCY:
+        score -= 1
 
-    adaptive_sample = int(candidate.get("adaptive_sample_size", 0))
-    adaptive_expectancy = safe_float(candidate.get("adaptive_expectancy"))
-
-    if (
-        CONFIG.FILTER.STRICT_EXPECTANCY_BLOCK
-        and adaptive_sample > 0
-        and adaptive_expectancy < CONFIG.FILTER.MIN_ADAPTIVE_EXPECTANCY
-    ):
-        return False, "NEGATIVE_EXPECTANCY_SETUP"
-
-    if safe_float(candidate["rr"]) < CONFIG.FILTER.MIN_RR:
-        return False, "LOW_RR"
-
-    if safe_float(candidate["volume_24h_usdt"]) < CONFIG.FILTER.MIN_24H_VOLUME_USDT:
-        return False, "LOW_VOLUME"
-
-    if safe_float(candidate["spread_pct"]) > CONFIG.FILTER.MAX_SPREAD_PCT:
-        return False, "HIGH_SPREAD"
-
-    if (
-        int(safe_float(candidate.get("funding_rate_available", 1), 1.0)) == 1
-        and abs(safe_float(candidate["funding_rate_pct"])) > CONFIG.FILTER.MAX_FUNDING_RATE_PCT
-    ):
-        return False, "FUNDING_TOO_HIGH"
-
-    if safe_float(candidate["expected_net_pnl_pct"]) < CONFIG.FILTER.MIN_EXPECTED_NET_PNL_PCT:
-        return False, "LOW_EXPECTED_NET_PNL"
-
-    order_type = normalize_status(candidate.get("order_type"))
-    event_reason = str(candidate.get("market_event_reason", ""))
-
-    if order_type == "MARKET" and event_reason not in {"A_PLUS_EVENT", "SUPPORTIVE_EVENT"}:
-        return False, "MARKET_ORDER_WITHOUT_EVENT_CONFIRMATION"
-
+    candidate["score"] = max(0, int(round(score)))
+    if candidate["score"] < CONFIG.FILTER.MIN_SCORE:
+        return False, "LOW_SCORE"
     return True, "OK"
 
 
 def create_virtual_order(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    candidate["status"] = "WATCHING"
+    live = safe_float(candidate.get("live_price"))
+    low = safe_float(candidate.get("entry_zone_low"))
+    high = safe_float(candidate.get("entry_zone_high"))
+    trigger = safe_float(candidate.get("entry_trigger"))
+    candidate["entry_type"] = "LIMIT_PULLBACK" if "PULLBACK" in normalize_status(candidate.get("setup_reason")) else "BREAKOUT_CONFIRM"
+    in_zone = low <= live <= high if low > 0 and high > 0 else False
+    near = abs(live - trigger) / trigger <= 0.0018 if trigger > 0 else False
+    candidate["status"] = "READY" if (in_zone or near) else "WATCHING"
     candidate["zone_touched"] = 0
+    candidate["watch_reason"] = "READY_IMMEDIATE_ZONE" if candidate["status"] == "READY" else "WAITING_ENTRY_ZONE"
     return stamp_updated(candidate)
 
 
@@ -1016,9 +1047,13 @@ def update_virtual_order_market_state(order: Dict[str, Any], market_ctx: Dict[st
         order["zone_touched"] = 1
         if get_order_status(order) in {"WATCHING", "PLANNED"}:
             order["status"] = "READY"
+            order["watch_reason"] = "ZONE_TOUCHED"
 
     if near_trigger(order, live_price):
         order["alarm_near_trigger_sent"] = order.get("alarm_near_trigger_sent", 0)
+        if get_order_status(order) in {"WATCHING", "PLANNED"}:
+            order["status"] = "READY"
+            order["watch_reason"] = "NEAR_TRIGGER"
 
     trigger = safe_float(order.get("entry_trigger"))
     if trigger > 0:
@@ -1038,8 +1073,12 @@ def update_virtual_order_market_state(order: Dict[str, Any], market_ctx: Dict[st
         ema20 = safe_float(tf_1h.get("ema20"))
         if side == "LONG" and live_price >= trigger * (1 + confirm_pct) and (ema20 <= 0 or live_price >= ema20):
             order["status"] = "READY"
+            order["watch_reason"] = "BREAKOUT_CONFIRM_LONG"
         elif side == "SHORT" and live_price <= trigger * (1 - confirm_pct) and (ema20 <= 0 or live_price <= ema20):
             order["status"] = "READY"
+            order["watch_reason"] = "BREAKOUT_CONFIRM_SHORT"
+    elif get_order_status(order) in {"WATCHING", "PLANNED"}:
+        order["watch_reason"] = order.get("watch_reason") or "WAITING_ENTRY_ZONE"
 
     return stamp_updated(order)
 
@@ -1066,10 +1105,37 @@ def maybe_reject_invalid_symbol_meta(candidate: Dict[str, Any], symbol_meta: Dic
     return True, "OK"
 
 
+def _order_setup_type(order: Dict[str, Any]) -> str:
+    return normalize_status(order.get("setup_type"))
+
+
+def _order_entry_type(order: Dict[str, Any]) -> str:
+    return normalize_status(order.get("entry_type"))
+
+
+def _is_breakout_order(order: Dict[str, Any]) -> bool:
+    setup_type = _order_setup_type(order)
+    setup_reason = normalize_status(order.get("setup_reason"))
+    entry_type = _order_entry_type(order)
+
+    return (
+        "BREAKOUT" in setup_type
+        or "BREAKDOWN" in setup_type
+        or "BREAKOUT" in setup_reason
+        or "BREAKDOWN" in setup_reason
+        or entry_type == "BREAKOUT_CONFIRM"
+    )
+
+
+def _is_pullback_like_order(order: Dict[str, Any]) -> bool:
+    return not _is_breakout_order(order)
+
+
 def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
     trigger = safe_float(order.get("entry_trigger"))
     live_price = safe_float(order.get("live_price"))
     side = str(order.get("side", "")).upper()
+    is_breakout = _is_breakout_order(order)
 
     order["exchange_status"] = "PAPER_NEW"
     order["status"] = "NEW"
@@ -1078,10 +1144,16 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
 
     should_fill = normalize_status(order.get("order_type")) == "MARKET"
     if not should_fill:
-        if side == "LONG" and live_price <= trigger:
-            should_fill = True
-        elif side == "SHORT" and live_price >= trigger:
-            should_fill = True
+        if is_breakout:
+            if side == "LONG" and live_price >= trigger:
+                should_fill = True
+            elif side == "SHORT" and live_price <= trigger:
+                should_fill = True
+        else:
+            if side == "LONG" and live_price <= trigger:
+                should_fill = True
+            elif side == "SHORT" and live_price >= trigger:
+                should_fill = True
 
     if should_fill:
         order["status"] = "FILLED"
@@ -1201,11 +1273,38 @@ def maybe_create_virtual_order(
     open_positions: List[Dict[str, Any]],
     optimizer_weights: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
+    if not market_ctx:
+        market_ctx = _get_market_context_from_local_cache(symbol)
     candidate = build_order_candidate(symbol, market_ctx)
     if not candidate:
         return None
 
-    candidate["score"] = score_candidate(candidate, market_ctx)
+    event_source = str(candidate.get("setup_type") or candidate.get("setup_reason") or "")
+    event_stats = {}
+    event_n = 0
+    event_wr = 0.0
+    event_bonus = 0
+
+    if event_source:
+        try:
+            event_key = build_event_key(event_source, market_ctx)
+            event_stats = get_event_stats(event_key) or {}
+        except Exception as exc:
+            log.exception("EVENT_MINER_LOOKUP_ERROR symbol=%s err=%s", symbol, type(exc).__name__)
+            event_stats = {}
+
+    if event_stats:
+        event_n = int(event_stats.get("n", 0) or 0)
+        event_wr = float(event_stats.get("win_rate", 0.0) or 0.0)
+
+        if event_n >= 20:
+            raw_bonus = (event_wr - 0.5) * 10.0
+            event_bonus = int(round(max(-2.0, min(2.0, raw_bonus))))
+
+    candidate["score"] = score_candidate(candidate, market_ctx) + event_bonus
+    candidate["event_miner_sample_size"] = event_n
+    candidate["event_miner_win_rate"] = event_wr
+    candidate["event_miner_score_bonus"] = event_bonus
     candidate["expected_net_pnl_pct"] = estimate_expected_net_pnl_pct(candidate)
     candidate["stop_net_loss_pct"] = estimate_stop_net_loss_pct(candidate)
 
@@ -1216,31 +1315,17 @@ def maybe_create_virtual_order(
     candidate["stop_net_loss_pct"] = estimate_stop_net_loss_pct(candidate)
 
     if int(candidate.get("adaptive_sample_size", 0)) > 0 and safe_float(candidate.get("adaptive_expectancy")) < 0:
-        log.info(
-            "ORDER_SKIP_NEG_EXPECTANCY %s expectancy=%s sample=%s",
-            symbol,
-            candidate.get("adaptive_expectancy", 0.0),
-            candidate.get("adaptive_sample_size", 0),
-        )
-        return None
-
-    if int(candidate.get("adaptive_blocked", 0)) == 1:
-        log.info(
-            "ORDER_SKIP_ADAPTIVE_BLOCK %s reason=%s expectancy=%s samples=%s",
-            symbol,
-            candidate.get("adaptive_reason", ""),
-            candidate.get("adaptive_expectancy", 0.0),
-            candidate.get("adaptive_sample_size", 0),
-        )
-        return None
+        candidate["score"] = max(0, int(candidate["score"]) - 1)
 
     ok, reason = passes_order_filters(candidate)
     if not ok:
         log.info(
-            "ORDER_SKIP_FILTER %s %s score=%s delta=%s exp=%s samples=%s event=%s event_wr=%s event_n=%s",
+            "ORDER_SKIP_FILTER %s %s score=%s setup=%s entry_type=%s delta=%s exp=%s samples=%s event=%s event_wr=%s event_n=%s",
             symbol,
             reason,
             candidate.get("score", 0),
+            candidate.get("setup_reason", ""),
+            candidate.get("entry_type", ""),
             candidate.get("adaptive_score_delta", 0),
             candidate.get("adaptive_expectancy", 0.0),
             candidate.get("adaptive_sample_size", 0),
@@ -1346,16 +1431,24 @@ def process_existing_order(
 
     if status in {"WATCHING", "PLANNED"}:
         age_min = get_order_age_minutes(order)
-        if age_min > 240 and int(order.get("zone_touched", 0)) == 0:
-            order["status"] = "EXPIRED"
-            order["exchange_status"] = "STALE_NO_TOUCH"
-            return stamp_updated(order)
+        if age_min > 240:
+            if _is_breakout_order(order):
+                order["status"] = "EXPIRED"
+                order["exchange_status"] = "STALE_NO_BREAKOUT"
+                order["close_reason"] = "STALE_NO_BREAKOUT"
+                return stamp_updated(order)
+            if int(order.get("zone_touched", 0)) == 0:
+                order["status"] = "EXPIRED"
+                order["exchange_status"] = "STALE_NO_TOUCH"
+                order["close_reason"] = "STALE_NO_TOUCH"
+                return stamp_updated(order)
 
     if get_order_status(order) == "READY":
         ok, reason = risk.can_open_new_order(order, open_orders, open_positions)
         if not ok:
             order["status"] = "CANCELLED"
             order["exchange_status"] = reason
+            order["close_reason"] = reason
             return stamp_updated(order)
 
         others = [o for o in open_orders if o.get("order_id") != order.get("order_id")]
@@ -1363,6 +1456,7 @@ def process_existing_order(
         if not ok:
             order["status"] = "CANCELLED"
             order["exchange_status"] = reason
+            order["close_reason"] = reason
             return stamp_updated(order)
 
         order = submit_real_order_from_virtual(order)
