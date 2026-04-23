@@ -49,14 +49,14 @@ fi
 
 if [ ! -f "$ORDER_PID_FILE" ]; then
   echo "Starting main_order.py ..."
-  nohup python3 main_order.py >> "$LOG_DIR/order.log" 2>&1 &
+  nohup python3 main_order.py > "$LOG_DIR/order.nohup.log" 2>&1 &
   echo $! > "$ORDER_PID_FILE"
   echo "main_order.py started with PID $(cat "$ORDER_PID_FILE")"
 fi
 
 if [ ! -f "$POSITION_PID_FILE" ]; then
   echo "Starting main_position.py ..."
-  nohup python3 main_position.py >> "$LOG_DIR/position.log" 2>&1 &
+  nohup python3 main_position.py > "$LOG_DIR/position.nohup.log" 2>&1 &
   echo $! > "$POSITION_PID_FILE"
   echo "main_position.py started with PID $(cat "$POSITION_PID_FILE")"
 fi

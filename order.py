@@ -1248,7 +1248,10 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tuple[float, Optional[str]]:
-    account_balance = binance.get_available_balance("USDT")
+    if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
+        account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 300.0), 300.0)
+    else:
+        account_balance = binance.get_available_balance("USDT")
     qty = risk.calc_position_size(
         entry=safe_float(order["entry_trigger"]),
         sl=safe_float(order["sl"]),
