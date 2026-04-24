@@ -38,6 +38,7 @@ ACTIVE_ORDER_STATUSES = {
     "WATCHING_RETRACE",
     "WAITING_RETRACE",
     "READY",
+    "WAITING_EXCHANGE_TRIGGER",
     "NEW",
     "PARTIALLY_FILLED",
 }
@@ -354,6 +355,10 @@ def _build_fallback_order_candidate(symbol: str, market_ctx: Dict[str, Any]) -> 
         "market_event_key": "",
         "market_event_blocked": 0,
         "market_event_reason": "",
+        "exchange_order_type": "",
+        "exchange_stop_price": 0.0,
+        "exchange_limit_price": 0.0,
+        "submitted_at": "",
     }
 
 
@@ -486,6 +491,10 @@ def _plan_to_candidate(
         "market_event_key": "",
         "market_event_blocked": 0,
         "market_event_reason": "",
+        "exchange_order_type": "",
+        "exchange_stop_price": 0.0,
+        "exchange_limit_price": 0.0,
+        "submitted_at": "",
     }
 
 
@@ -1264,6 +1273,76 @@ def should_override_negative_expectancy(order: Dict[str, Any]) -> bool:
     return True
 
 
+def _entry_chase_distance_pct(order: Dict[str, Any], live_price: float) -> float:
+    trigger = safe_float(order.get("entry_trigger"))
+    if trigger <= 0 or live_price <= 0:
+        return 0.0
+    side = normalize_status(order.get("side"))
+    if side == "LONG":
+        return max(0.0, (live_price - trigger) / trigger * 100.0)
+    if side == "SHORT":
+        return max(0.0, (trigger - live_price) / trigger * 100.0)
+    return 0.0
+
+
+def _has_exchange_order_reference(order: Dict[str, Any]) -> bool:
+    return bool(
+        order.get("real_order_id")
+        or order.get("binance_order_id")
+        or order.get("exchange_order_id")
+    )
+
+
+def _has_duplicate_stop_entry_intent(order: Dict[str, Any], open_orders: List[Dict[str, Any]]) -> bool:
+    symbol = order.get("symbol")
+    side = normalize_status(order.get("side"))
+    trigger = safe_float(order.get("entry_trigger"))
+    current_id = order.get("order_id")
+
+    for other in open_orders:
+        if other.get("order_id") == current_id:
+            continue
+        if is_final_order_status(other.get("status")):
+            continue
+        if other.get("symbol") != symbol:
+            continue
+        if normalize_status(other.get("side")) != side:
+            continue
+        if abs(safe_float(other.get("entry_trigger")) - trigger) > 1e-10:
+            continue
+        other_type = normalize_status(other.get("exchange_order_type") or other.get("order_type"))
+        if other_type in {"STOP_MARKET", "STOP_LIMIT", "STOP"} and _has_exchange_order_reference(other):
+            return True
+    return False
+
+
+def _should_block_negative_expectancy(order: Dict[str, Any]) -> bool:
+    adaptive_reason = normalize_status(order.get("adaptive_reason"))
+    blocked = (
+        "BLOCK_NEGATIVE_EXPECTANCY" in adaptive_reason
+        or (
+            int(order.get("adaptive_sample_size", 0)) > 0
+            and safe_float(order.get("adaptive_expectancy")) < 0
+            and bool(CONFIG.FILTER.STRICT_EXPECTANCY_BLOCK)
+        )
+    )
+    if not blocked:
+        return False
+    if should_override_negative_expectancy(order):
+        order["expectancy_override"] = "A_PLUS_EXPECTANCY_OVERRIDE"
+        log.info(
+            "A_PLUS_EXPECTANCY_OVERRIDE symbol=%s order_id=%s side=%s expectancy=%s event_wr=%s event_n=%s",
+            order.get("symbol"),
+            order.get("order_id"),
+            order.get("side"),
+            order.get("adaptive_expectancy"),
+            order.get("market_event_winrate"),
+            order.get("market_event_sample_size"),
+        )
+        return False
+    return True
+
+
 def should_block_spike_chase(order: Dict[str, Any], market_ctx: Dict[str, Any]) -> bool:
     if normalize_status(order.get("order_type")) != "MARKET":
         return False
@@ -1380,7 +1459,10 @@ def _preempt_weaker_orders_if_needed(order: Dict[str, Any], open_orders: List[Di
 
 
 def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
+    order_type = normalize_status(order.get("order_type"))
     trigger = safe_float(order.get("entry_trigger"))
+    if order_type in {"STOP_MARKET", "STOP_LIMIT"}:
+        trigger = safe_float(order.get("exchange_stop_price", trigger))
     live_price = safe_float(order.get("live_price"))
     live_high = max(live_price, safe_float(order.get("live_high", 0.0)))
     live_low = min([v for v in [live_price, safe_float(order.get("live_low", 0.0))] if v > 0] or [live_price])
@@ -1394,11 +1476,13 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
 
     should_fill = _should_fill_pending_order(
         side=side,
-        order_type=normalize_status(order.get("order_type")),
+        order_type=order_type,
         is_breakout=is_breakout,
         trigger=trigger,
         live_high=live_high,
         live_low=live_low,
+        stop_price=safe_float(order.get("exchange_stop_price", 0.0)),
+        limit_price=safe_float(order.get("exchange_limit_price", 0.0)),
     )
 
     log.info(
@@ -1407,7 +1491,7 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
         order.get("order_id"),
         order.get("status"),
         side,
-        order.get("order_type"),
+        order_type,
         int(is_breakout),
         trigger,
         live_price,
@@ -1420,7 +1504,10 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
         order["status"] = "FILLED"
         order["exchange_status"] = "PAPER_FILLED"
         order["executed_qty"] = safe_float(order.get("submitted_qty"))
-        order["avg_fill_price"] = live_price if normalize_status(order.get("order_type")) == "MARKET" else trigger
+        if order_type in {"LIMIT", "STOP_LIMIT"}:
+            order["avg_fill_price"] = safe_float(order.get("exchange_limit_price", trigger)) or trigger
+        else:
+            order["avg_fill_price"] = live_price
         log.info(
             "ORDER_PAPER_FILLED symbol=%s order_id=%s side=%s trigger=%s fill=%s qty=%s",
             order.get("symbol"),
@@ -1448,12 +1535,15 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
 def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
     if CONFIG.ENGINE.EXECUTION_MODE != "PAPER":
         return order
-    if get_order_status(order) not in {"NEW", "PARTIALLY_FILLED"}:
+    if get_order_status(order) not in {"NEW", "PARTIALLY_FILLED", "WAITING_EXCHANGE_TRIGGER"}:
         return order
     if normalize_status(order.get("exchange_status")) == "PAPER_FILLED":
         return order
 
+    order_type = normalize_status(order.get("order_type"))
     trigger = safe_float(order.get("entry_trigger"))
+    if order_type in {"STOP_MARKET", "STOP_LIMIT"}:
+        trigger = safe_float(order.get("exchange_stop_price", trigger))
     live_price = safe_float(order.get("live_price"))
     live_high = max(live_price, safe_float(order.get("live_high", 0.0)))
     live_low = min([v for v in [live_price, safe_float(order.get("live_low", 0.0))] if v > 0] or [live_price])
@@ -1468,6 +1558,8 @@ def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
         trigger=trigger,
         live_high=live_high,
         live_low=live_low,
+        stop_price=safe_float(order.get("exchange_stop_price", 0.0)),
+        limit_price=safe_float(order.get("exchange_limit_price", 0.0)),
     )
     log.info(
         "ORDER_PAPER_RECONCILE_CHECK symbol=%s order_id=%s side=%s type=%s breakout=%s trigger=%s live=%s high=%s low=%s eligible=%s",
@@ -1489,7 +1581,10 @@ def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
     order["status"] = "FILLED"
     order["exchange_status"] = "PAPER_FILLED"
     order["executed_qty"] = safe_float(order.get("submitted_qty"))
-    order["avg_fill_price"] = live_price if order_type == "MARKET" else trigger
+    if order_type in {"LIMIT", "STOP_LIMIT"}:
+        order["avg_fill_price"] = safe_float(order.get("exchange_limit_price", trigger)) or trigger
+    else:
+        order["avg_fill_price"] = live_price
     log.info(
         "ORDER_PAPER_RECONCILE_FILLED symbol=%s order_id=%s side=%s trigger=%s fill=%s qty=%s",
         order.get("symbol"),
@@ -1519,9 +1614,22 @@ def _should_fill_pending_order(
     trigger: float,
     live_high: float,
     live_low: float,
+    stop_price: float = 0.0,
+    limit_price: float = 0.0,
 ) -> bool:
     if order_type == "MARKET":
         return True
+    if order_type == "STOP_MARKET":
+        stop = stop_price if stop_price > 0 else trigger
+        return (side == "LONG" and live_high >= stop) or (side == "SHORT" and live_low <= stop)
+    if order_type == "STOP_LIMIT":
+        stop = stop_price if stop_price > 0 else trigger
+        limit = limit_price if limit_price > 0 else trigger
+        if side == "LONG":
+            return live_high >= stop and live_low <= limit
+        if side == "SHORT":
+            return live_low <= stop and live_high >= limit
+        return False
     if trigger <= 0:
         return False
     if is_breakout:
@@ -1689,6 +1797,113 @@ def _ensure_client_order_id(order: Dict[str, Any]) -> Dict[str, Any]:
             safe_float(order["entry_trigger"]),
         )
     return order
+
+
+def _resolve_ready_execution_type(order: Dict[str, Any]) -> str:
+    order_type = normalize_status(order.get("order_type"))
+    if not bool(CONFIG.TRADE.USE_STOP_ENTRY_ORDERS):
+        return order_type or "MARKET"
+    if not _is_breakout_order(order):
+        return order_type or "MARKET"
+    if bool(CONFIG.TRADE.USE_STOP_LIMIT_FOR_BREAKOUT):
+        return "STOP_LIMIT"
+    configured = normalize_status(getattr(CONFIG.TRADE, "STOP_ENTRY_ORDER_TYPE", "STOP_MARKET"))
+    return "STOP_MARKET" if configured not in {"STOP_MARKET", "STOP_LIMIT"} else configured
+
+
+def _submit_stop_entry_from_ready(order: Dict[str, Any], open_orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if _has_exchange_order_reference(order):
+        log.info("STOP_ENTRY_ALREADY_EXISTS symbol=%s order_id=%s side=%s", order.get("symbol"), order.get("order_id"), order.get("side"))
+        return order
+    if _has_duplicate_stop_entry_intent(order, open_orders):
+        log.info("STOP_ENTRY_ALREADY_EXISTS symbol=%s order_id=%s side=%s", order.get("symbol"), order.get("order_id"), order.get("side"))
+        return order
+
+    symbol_meta = binance.get_symbol_meta(order["symbol"])
+    ok, reason = maybe_reject_invalid_symbol_meta(order, symbol_meta)
+    if not ok:
+        order["status"] = "REJECTED"
+        order["exchange_status"] = reason
+        return stamp_updated(order)
+
+    qty, qty_error = _prepare_order_qty(order, symbol_meta)
+    if qty_error:
+        order["status"] = "REJECTED"
+        order["exchange_status"] = qty_error
+        return stamp_updated(order)
+
+    trigger = safe_float(order.get("entry_trigger"))
+    limit_price = 0.0
+    execution_type = _resolve_ready_execution_type(order)
+    if execution_type == "STOP_LIMIT":
+        offset_pct = max(0.0, safe_float(CONFIG.TRADE.STOP_ENTRY_LIMIT_OFFSET_PCT))
+        if normalize_status(order.get("side")) == "LONG":
+            limit_price = trigger * (1.0 + offset_pct / 100.0)
+        else:
+            limit_price = trigger * (1.0 - offset_pct / 100.0)
+
+    order["submitted_qty"] = qty
+    order = _ensure_client_order_id(order)
+
+    if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
+        order["order_type"] = execution_type
+        order["exchange_order_type"] = execution_type
+        order["exchange_stop_price"] = trigger
+        order["exchange_limit_price"] = limit_price
+        order["exchange_order_id"] = order.get("exchange_order_id") or order.get("client_order_id")
+        order["exchange_status"] = "PAPER_NEW"
+        order["submitted_at"] = now_utc()
+        order["status"] = "WAITING_EXCHANGE_TRIGGER"
+        log.info(
+            "STOP_ENTRY_ORDER_SUBMITTED symbol=%s order_id=%s side=%s type=%s stop_price=%s limit_price=%s qty=%s",
+            order.get("symbol"),
+            order.get("order_id"),
+            order.get("side"),
+            execution_type,
+            trigger,
+            limit_price,
+            qty,
+        )
+        return stamp_updated(order)
+
+    try:
+        resp = binance.safe_submit_order(
+            binance.place_stop_entry,
+            order["symbol"],
+            order["client_order_id"],
+            order["symbol"],
+            order["side"],
+            qty,
+            trigger,
+            order["client_order_id"],
+            limit_price if execution_type == "STOP_LIMIT" else None,
+        )
+    except Exception as exc:
+        order["status"] = "FAILED"
+        order["exchange_status"] = f"SUBMIT_ERROR:{type(exc).__name__}:{str(exc)}"
+        order["submit_error_detail"] = str(exc)
+        return stamp_updated(order)
+
+    order["order_type"] = execution_type
+    order["exchange_order_type"] = execution_type
+    order["exchange_stop_price"] = trigger
+    order["exchange_limit_price"] = limit_price
+    order["exchange_order_id"] = resp.get("orderId", order.get("exchange_order_id", ""))
+    order["exchange_status"] = normalize_status(resp.get("status", "NEW"))
+    order["submitted_at"] = now_utc()
+    order["status"] = "WAITING_EXCHANGE_TRIGGER"
+    log.info(
+        "STOP_ENTRY_ORDER_SUBMITTED symbol=%s order_id=%s side=%s type=%s stop_price=%s limit_price=%s qty=%s",
+        order.get("symbol"),
+        order.get("order_id"),
+        order.get("side"),
+        execution_type,
+        trigger,
+        limit_price,
+        qty,
+    )
+    notify_real_order_submitted(order)
+    return stamp_updated(order)
 
 
 def _submit_real_exchange_order(order: Dict[str, Any], qty: float) -> Dict[str, Any]:
@@ -2039,41 +2254,41 @@ def process_existing_order(
                                    ))
 
     if trigger_touched and status in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED", "READY"}:
-        adaptive_reason = normalize_status(order.get("adaptive_reason"))
-        blocked_negative_expectancy = (
-            "BLOCK_NEGATIVE_EXPECTANCY" in adaptive_reason
-            or (
-                int(order.get("adaptive_sample_size", 0)) > 0
-                and safe_float(order.get("adaptive_expectancy")) < 0
-                and bool(CONFIG.FILTER.STRICT_EXPECTANCY_BLOCK)
+        if _should_block_negative_expectancy(order):
+            order["status"] = "CANCELLED"
+            order["exchange_status"] = "NEGATIVE_EXPECTANCY_BLOCKED"
+            order["close_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
+            order["cancel_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
+            log.info(
+                "NEGATIVE_EXPECTANCY_BLOCKED symbol=%s order_id=%s side=%s expectancy=%s reason=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                order.get("side"),
+                order.get("adaptive_expectancy"),
+                order.get("adaptive_reason"),
             )
-        )
-        if blocked_negative_expectancy:
-            if should_override_negative_expectancy(order):
-                order["expectancy_override"] = "A_PLUS_EXPECTANCY_OVERRIDE"
-                log.info(
-                    "A_PLUS_EXPECTANCY_OVERRIDE symbol=%s order_id=%s side=%s expectancy=%s event_wr=%s event_n=%s",
-                    order.get("symbol"),
-                    order.get("order_id"),
-                    order.get("side"),
-                    order.get("adaptive_expectancy"),
-                    order.get("market_event_winrate"),
-                    order.get("market_event_sample_size"),
-                )
-            else:
-                order["status"] = "CANCELLED"
-                order["exchange_status"] = "NEGATIVE_EXPECTANCY_BLOCKED"
-                order["close_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
-                order["cancel_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
-                log.info(
-                    "NEGATIVE_EXPECTANCY_BLOCKED symbol=%s order_id=%s side=%s expectancy=%s reason=%s",
-                    order.get("symbol"),
-                    order.get("order_id"),
-                    order.get("side"),
-                    order.get("adaptive_expectancy"),
-                    order.get("adaptive_reason"),
-                )
-                return stamp_updated(order)
+
+            return stamp_updated(order)
+
+        distance_pct = _entry_chase_distance_pct(order, safe_float(order.get("live_price")))
+        max_chase_pct = max(0.0, safe_float(CONFIG.TRADE.MAX_ENTRY_CHASE_PCT))
+        order["entry_chase_distance_pct"] = distance_pct
+        if distance_pct > max_chase_pct:
+            order["status"] = "REJECTED"
+            order["exchange_status"] = "MISSED_ENTRY_TOO_FAR"
+            order["close_reason"] = "MISSED_ENTRY_TOO_FAR"
+            order["cancel_reason"] = "MISSED_ENTRY_TOO_FAR"
+            log.info(
+                "ENTRY_CHASE_REJECTED symbol=%s order_id=%s side=%s trigger=%s live=%s distance_pct=%s max_chase_pct=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                order.get("side"),
+                order.get("entry_trigger"),
+                order.get("live_price"),
+                distance_pct,
+                max_chase_pct,
+            )
+            return stamp_updated(order)
 
         if should_block_spike_chase(order, market_ctx):
             if bool(CONFIG.TRADE.ENABLE_SPIKE_RETRACE_ENTRY):
@@ -2136,6 +2351,57 @@ def process_existing_order(
                 return stamp_updated(order)
 
     if get_order_status(order) == "READY":
+
+        if _should_block_negative_expectancy(order):
+            order["status"] = "CANCELLED"
+            order["exchange_status"] = "NEGATIVE_EXPECTANCY_BLOCKED"
+            order["close_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
+            order["cancel_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
+            log.info(
+                "NEGATIVE_EXPECTANCY_BLOCKED symbol=%s order_id=%s side=%s expectancy=%s reason=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                order.get("side"),
+                order.get("adaptive_expectancy"),
+                order.get("adaptive_reason"),
+            )
+            return stamp_updated(order)
+
+        live_price = safe_float(order.get("live_price"))
+        distance_pct = _entry_chase_distance_pct(order, live_price)
+        max_chase_pct = max(0.0, safe_float(CONFIG.TRADE.MAX_ENTRY_CHASE_PCT))
+        order["entry_chase_distance_pct"] = distance_pct
+        selected_execution = _resolve_ready_execution_type(order)
+        log.info(
+            "ENTRY_EXECUTION_DECISION symbol=%s order_id=%s side=%s setup=%s order_type=%s trigger=%s live=%s distance_pct=%s expectancy=%s selected_execution=%s",
+            order.get("symbol"),
+            order.get("order_id"),
+            order.get("side"),
+            order.get("setup_type"),
+            order.get("order_type"),
+            order.get("entry_trigger"),
+            live_price,
+            distance_pct,
+            safe_float(order.get("adaptive_expectancy")),
+            selected_execution,
+        )
+
+        if distance_pct > max_chase_pct:
+            order["status"] = "REJECTED"
+            order["exchange_status"] = "MISSED_ENTRY_TOO_FAR"
+            order["close_reason"] = "MISSED_ENTRY_TOO_FAR"
+            order["cancel_reason"] = "MISSED_ENTRY_TOO_FAR"
+            log.info(
+                "ENTRY_CHASE_REJECTED symbol=%s order_id=%s side=%s trigger=%s live=%s distance_pct=%s max_chase_pct=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                order.get("side"),
+                order.get("entry_trigger"),
+                live_price,
+                distance_pct,
+                max_chase_pct,
+            )
+            return stamp_updated(order)
         ok, reason = risk.can_open_new_order(order, open_orders, open_positions)
         if not ok and reason == "MAX_OPEN_ORDERS_REACHED":
             cancelled = _preempt_weaker_orders_if_needed(order, open_orders)
@@ -2166,13 +2432,31 @@ def process_existing_order(
             order["close_reason"] = reason
             return stamp_updated(order)
 
-        order = submit_real_order_from_virtual(order)
+        if (
+            bool(CONFIG.TRADE.USE_STOP_ENTRY_ORDERS)
+            and not trigger_touched
+            and _is_breakout_order(order)
+            and not _has_exchange_order_reference(order)
+        ):
+            order = _submit_stop_entry_from_ready(order, open_orders)
+        elif bool(CONFIG.TRADE.USE_STOP_ENTRY_ORDERS) and _has_exchange_order_reference(order):
+            log.info("STOP_ENTRY_ALREADY_EXISTS symbol=%s order_id=%s side=%s", order.get("symbol"), order.get("order_id"), order.get("side"))
+            order["status"] = "WAITING_EXCHANGE_TRIGGER"
+            order = stamp_updated(order)
+        else:
+            order = submit_real_order_from_virtual(order)
 
-    if get_order_status(order) in {"NEW", "PARTIALLY_FILLED"}:
+    if get_order_status(order) in {"NEW", "PARTIALLY_FILLED", "WAITING_EXCHANGE_TRIGGER"}:
         if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
             order = _paper_reconcile_pending_order(order)
         else:
             order = reconcile_exchange_order_status(order)
+        if (
+                get_order_status(order) in {"CANCELLED", "EXPIRED", "REJECTED"}
+                and normalize_status(order.get("exchange_status")) in {"CANCELED", "EXPIRED", "REJECTED"}
+                and normalize_status(order.get("close_reason")) == ""
+        ):
+            order["close_reason"] = normalize_status(order.get("exchange_status"))
 
     return order
 

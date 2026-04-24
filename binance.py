@@ -557,6 +557,41 @@ def place_market_entry(
     return _request("POST", "/fapi/v1/order", params, signed=True)
 
 
+def place_stop_entry(
+    symbol: str,
+    side: str,
+    qty: float,
+    stop_price: float,
+    client_order_id: str,
+    limit_price: Optional[float] = None,
+) -> Dict[str, Any]:
+    is_stop_market = limit_price is None
+    normalized = normalize_order_params(
+        symbol,
+        qty=qty,
+        stop_price=stop_price,
+        price=limit_price,
+        is_market=is_stop_market,
+    )
+    params = {
+        "symbol": symbol,
+        "side": _futures_side(side),
+        "quantity": normalized["qty"],
+        "newClientOrderId": client_order_id,
+        "stopPrice": normalized["stop_price"],
+        "workingType": "MARK_PRICE",
+        "reduceOnly": "false",
+    }
+    if is_stop_market:
+        params["type"] = "STOP_MARKET"
+    else:
+        params["type"] = "STOP"
+        params["timeInForce"] = "GTC"
+        params["price"] = normalized["price"]
+
+    return _request("POST", "/fapi/v1/order", params, signed=True)
+
+
 # =========================================================
 # CONDITIONAL / PROTECTION ORDERS
 # IMPORTANT:
