@@ -88,6 +88,21 @@ EVENT_SCORE_PENALTY_BAD = -4
 
 log = get_logger("order", "logs/order.log")
 
+if not hasattr(CONFIG, "BREAKOUT_DETECTION_PCT"):
+    CONFIG.BREAKOUT_DETECTION_PCT = 0.20
+if not hasattr(CONFIG, "BREAKOUT_VOLUME_MULTIPLIER"):
+    CONFIG.BREAKOUT_VOLUME_MULTIPLIER = 2.0
+if not hasattr(CONFIG, "BREAKOUT_EXPECTANCY_OVERRIDE"):
+    CONFIG.BREAKOUT_EXPECTANCY_OVERRIDE = True
+if not hasattr(CONFIG, "BREAKOUT_MIN_SCORE"):
+    CONFIG.BREAKOUT_MIN_SCORE = 6
+if not hasattr(CONFIG, "BREAKOUT_MAX_CHASE_PCT"):
+    CONFIG.BREAKOUT_MAX_CHASE_PCT = 0.45
+if not hasattr(CONFIG, "USE_BREAKOUT_STOP_MARKET"):
+    CONFIG.USE_BREAKOUT_STOP_MARKET = True
+if not hasattr(CONFIG, "LOG_ENTRY_DECISION_DETAIL"):
+    CONFIG.LOG_ENTRY_DECISION_DETAIL = True
+
 
 # ============================================================================
 # basic helpers
@@ -359,6 +374,10 @@ def _build_fallback_order_candidate(symbol: str, market_ctx: Dict[str, Any]) -> 
         "exchange_stop_price": 0.0,
         "exchange_limit_price": 0.0,
         "submitted_at": "",
+        "entry_execution": "",
+        "is_breakout": 0,
+        "breakout_distance_pct": 0.0,
+        "breakout_volume_multiplier": 1.0,
     }
 
 
@@ -495,6 +514,10 @@ def _plan_to_candidate(
         "exchange_stop_price": 0.0,
         "exchange_limit_price": 0.0,
         "submitted_at": "",
+        "entry_execution": "",
+        "is_breakout": 0,
+        "breakout_distance_pct": 0.0,
+        "breakout_volume_multiplier": 1.0,
     }
 
 
@@ -1285,6 +1308,140 @@ def _entry_chase_distance_pct(order: Dict[str, Any], live_price: float) -> float
     return 0.0
 
 
+def _extract_recent_volumes(market_ctx: Dict[str, Any]) -> List[float]:
+    volume_keys = ("recent_volumes", "candle_volumes", "volumes", "kline_volumes")
+    for key in volume_keys:
+        raw = market_ctx.get(key)
+        if isinstance(raw, list):
+            values = [safe_float(v) for v in raw if safe_float(v) > 0]
+            if values:
+                return values
+    candles = market_ctx.get("recent_candles")
+    if isinstance(candles, list):
+        values = [safe_float(c.get("volume")) for c in candles if isinstance(c, dict)]
+        values = [v for v in values if v > 0]
+        if values:
+            return values
+    return []
+
+
+def detect_breakout_context(order: Dict[str, Any], market_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    side = normalize_status(order.get("side"))
+    trigger_price = safe_float(order.get("entry_trigger"))
+    zone_high = safe_float(order.get("entry_zone_high"))
+    zone_low = safe_float(order.get("entry_zone_low"))
+
+    live_price = safe_float(market_ctx.get("last_price", order.get("live_price", 0.0)))
+    if live_price <= 0:
+        live_price = safe_float(order.get("live_price"))
+    last_close = safe_float(market_ctx.get("last_1m_close", market_ctx.get("candle_close", market_ctx.get("close", 0.0))))
+    last_high = safe_float(market_ctx.get("last_1m_high", market_ctx.get("candle_high", market_ctx.get("high", 0.0))))
+    last_low = safe_float(market_ctx.get("last_1m_low", market_ctx.get("candle_low", market_ctx.get("low", 0.0))))
+    if live_price <= 0:
+        live_price = max(last_close, last_high, last_low)
+
+    price_distance_pct = _entry_chase_distance_pct(order, live_price)
+    threshold_pct = max(0.0, safe_float(getattr(CONFIG, "BREAKOUT_DETECTION_PCT", 0.20))) / 100.0
+    score = int(safe_float(order.get("score", 0)))
+
+    volumes = _extract_recent_volumes(market_ctx)
+    volume_multiplier = 1.0
+    if len(volumes) >= 2:
+        last_volume = safe_float(volumes[-1])
+        previous = [safe_float(v) for v in volumes[-21:-1] if safe_float(v) > 0]
+        avg_previous = (sum(previous) / len(previous)) if previous else 0.0
+        if last_volume > 0 and avg_previous > 0:
+            volume_multiplier = last_volume / avg_previous
+
+    zone_break = False
+    reason = "NOT_BREAKOUT_ZONE"
+    if side == "LONG" and zone_high > 0 and live_price > 0:
+        zone_break = live_price >= zone_high * (1.0 + threshold_pct)
+    elif side == "SHORT" and zone_low > 0 and live_price > 0:
+        zone_break = live_price <= zone_low * (1.0 - threshold_pct)
+
+    confirms = (
+        volume_multiplier >= max(0.0, safe_float(getattr(CONFIG, "BREAKOUT_VOLUME_MULTIPLIER", 2.0)))
+        or score >= int(getattr(CONFIG, "BREAKOUT_MIN_SCORE", 6))
+    )
+    is_breakout = bool(zone_break and confirms)
+
+    if zone_break and not confirms:
+        reason = "BREAKOUT_UNCONFIRMED"
+    elif zone_break and confirms:
+        reason = "BREAKOUT_CONFIRMED"
+    elif trigger_price <= 0:
+        reason = "NO_TRIGGER"
+
+    direction = side if is_breakout else ""
+    return {
+        "is_breakout": is_breakout,
+        "breakout_direction": direction if direction in {"LONG", "SHORT"} else "",
+        "price_distance_pct": price_distance_pct,
+        +        +        +  volume_multiplier,
+        "reason": reason,
+    }
+
+
+def classify_entry_execution(order: Dict[str, Any], market_ctx: Dict[str, Any]) -> str:
+    breakout = detect_breakout_context(order, market_ctx)
+    order["is_breakout"] = int(breakout.get("is_breakout", False))
+    order["breakout_distance_pct"] = safe_float(breakout.get("price_distance_pct", 0.0))
+    order["breakout_volume_multiplier"] = safe_float(breakout.get("volume_multiplier", 1.0), 1.0)
+
+    max_breakout_chase = max(0.0, safe_float(getattr(CONFIG, "BREAKOUT_MAX_CHASE_PCT", 0.45)))
+    trigger_touched = bool(int(order.get("entry_trigger_touched", 0)))
+
+    if breakout.get("is_breakout"):
+        if safe_float(breakout.get("price_distance_pct", 0.0)) > max_breakout_chase:
+            return "REJECT_TOO_LATE"
+        if bool(getattr(CONFIG, "USE_BREAKOUT_STOP_MARKET", True)) and not trigger_touched:
+            return "BREAKOUT_STOP_MARKET"
+        return "BREAKOUT_MARKET"
+
+    if _should_block_negative_expectancy(order, market_ctx=market_ctx, breakout_ctx=breakout):
+        return "REJECT_NEGATIVE_EXPECTANCY"
+
+    live_price = safe_float(market_ctx.get("last_price", order.get("live_price", 0.0)))
+    if zone_is_touched(order, live_price) or int(order.get("zone_touched", 0)) == 1:
+        return "PULLBACK_MARKET"
+    return "PULLBACK_LIMIT"
+
+
+def _log_entry_execution_decision(
+    order: Dict[str, Any],
+    market_ctx: Dict[str, Any],
+    selected_execution: str,
+    reason: str,
+    breakout_ctx: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not bool(getattr(CONFIG, "LOG_ENTRY_DECISION_DETAIL", True)):
+        return
+    info = breakout_ctx or detect_breakout_context(order, market_ctx)
+    live = safe_float(market_ctx.get("last_price", order.get("live_price", 0.0)))
+    log.info(
+        "ENTRY_EXECUTION_DECISION symbol=%s order_id=%s side=%s setup=%s trigger=%s live=%s zone_low=%s zone_high=%s score=%s expectancy=%s samples=%s event=%s event_wr=%s is_breakout=%s price_distance_pct=%s volume_multiplier=%s selected_execution=%s reason=%s",
+        order.get("symbol"),
+        order.get("order_id"),
+        order.get("side"),
+        order.get("setup_type"),
+        order.get("entry_trigger"),
+        live,
+        order.get("entry_zone_low"),
+        order.get("entry_zone_high"),
+        order.get("score", 0),
+        order.get("adaptive_expectancy", 0.0),
+        order.get("adaptive_sample_size", 0),
+        order.get("market_event_key", ""),
+        order.get("market_event_winrate", 0.0),
+        int(bool(info.get("is_breakout"))),
+        safe_float(info.get("price_distance_pct", 0.0)),
+        safe_float(info.get("volume_multiplier", 1.0)),
+        selected_execution,
+        reason,
+    )
+
+
 def _has_exchange_order_reference(order: Dict[str, Any]) -> bool:
     return bool(
         order.get("real_order_id")
@@ -1316,7 +1473,11 @@ def _has_duplicate_stop_entry_intent(order: Dict[str, Any], open_orders: List[Di
     return False
 
 
-def _should_block_negative_expectancy(order: Dict[str, Any]) -> bool:
+def _should_block_negative_expectancy(
+    order: Dict[str, Any],
+    market_ctx: Optional[Dict[str, Any]] = None,
+    breakout_ctx: Optional[Dict[str, Any]] = None,
+) -> bool:
     adaptive_reason = normalize_status(order.get("adaptive_reason"))
     blocked = (
         "BLOCK_NEGATIVE_EXPECTANCY" in adaptive_reason
@@ -1328,6 +1489,31 @@ def _should_block_negative_expectancy(order: Dict[str, Any]) -> bool:
     )
     if not blocked:
         return False
+
+    if breakout_ctx is None:
+        breakout_ctx = detect_breakout_context(order, market_ctx or {})
+
+    if breakout_ctx.get("is_breakout"):
+        score = int(safe_float(order.get("score", 0)))
+        min_score = int(getattr(CONFIG, "BREAKOUT_MIN_SCORE", 6))
+        if bool(getattr(CONFIG, "BREAKOUT_EXPECTANCY_OVERRIDE", True)) and score >= min_score:
+            order["expectancy_override"] = "BREAKOUT_EXPECTANCY_OVERRIDE"
+            log.info(
+                "BREAKOUT_EXPECTANCY_OVERRIDE symbol=%s order_id=%s side=%s expectancy=%s score=%s samples=%s event=%s event_wr=%s price_distance_pct=%s volume_multiplier=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                order.get("side"),
+                order.get("adaptive_expectancy"),
+                score,
+                order.get("adaptive_sample_size", 0),
+                order.get("market_event_key", ""),
+                order.get("market_event_winrate", 0.0),
+                safe_float(breakout_ctx.get("price_distance_pct", 0.0)),
+                safe_float(breakout_ctx.get("volume_multiplier", 1.0)),
+            )
+            return False
+        return True
+
     if should_override_negative_expectancy(order):
         order["expectancy_override"] = "A_PLUS_EXPECTANCY_OVERRIDE"
         log.info(
@@ -1506,6 +1692,8 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
         order["executed_qty"] = safe_float(order.get("submitted_qty"))
         if order_type in {"LIMIT", "STOP_LIMIT"}:
             order["avg_fill_price"] = safe_float(order.get("exchange_limit_price", trigger)) or trigger
+        elif order_type == "STOP_MARKET":
+            order["avg_fill_price"] = safe_float(order.get("exchange_stop_price", trigger)) or trigger
         else:
             order["avg_fill_price"] = live_price
         log.info(
@@ -1583,6 +1771,8 @@ def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
     order["executed_qty"] = safe_float(order.get("submitted_qty"))
     if order_type in {"LIMIT", "STOP_LIMIT"}:
         order["avg_fill_price"] = safe_float(order.get("exchange_limit_price", trigger)) or trigger
+    elif order_type == "STOP_MARKET":
+        order["avg_fill_price"] = safe_float(order.get("exchange_stop_price", trigger)) or trigger
     else:
         order["avg_fill_price"] = live_price
     log.info(
@@ -1811,7 +2001,11 @@ def _resolve_ready_execution_type(order: Dict[str, Any]) -> str:
     return "STOP_MARKET" if configured not in {"STOP_MARKET", "STOP_LIMIT"} else configured
 
 
-def _submit_stop_entry_from_ready(order: Dict[str, Any], open_orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _submit_stop_entry_from_ready(
+    order: Dict[str, Any],
+    open_orders: List[Dict[str, Any]],
+    selected_execution: str = "",
+) -> Dict[str, Any]:
     if _has_exchange_order_reference(order):
         log.info("STOP_ENTRY_ALREADY_EXISTS symbol=%s order_id=%s side=%s", order.get("symbol"), order.get("order_id"), order.get("side"))
         return order
@@ -1834,7 +2028,7 @@ def _submit_stop_entry_from_ready(order: Dict[str, Any], open_orders: List[Dict[
 
     trigger = safe_float(order.get("entry_trigger"))
     limit_price = 0.0
-    execution_type = _resolve_ready_execution_type(order)
+    execution_type = "STOP_MARKET" if selected_execution == "BREAKOUT_STOP_MARKET" else _resolve_ready_execution_type(order)
     if execution_type == "STOP_LIMIT":
         offset_pct = max(0.0, safe_float(CONFIG.TRADE.STOP_ENTRY_LIMIT_OFFSET_PCT))
         if normalize_status(order.get("side")) == "LONG":
@@ -1855,13 +2049,11 @@ def _submit_stop_entry_from_ready(order: Dict[str, Any], open_orders: List[Dict[
         order["submitted_at"] = now_utc()
         order["status"] = "WAITING_EXCHANGE_TRIGGER"
         log.info(
-            "STOP_ENTRY_ORDER_SUBMITTED symbol=%s order_id=%s side=%s type=%s stop_price=%s limit_price=%s qty=%s",
+            "BREAKOUT_STOP_ORDER_SUBMITTED symbol=%s order_id=%s side=%s stop_price=%s qty=%s",
             order.get("symbol"),
             order.get("order_id"),
             order.get("side"),
-            execution_type,
             trigger,
-            limit_price,
             qty,
         )
         return stamp_updated(order)
@@ -1893,13 +2085,11 @@ def _submit_stop_entry_from_ready(order: Dict[str, Any], open_orders: List[Dict[
     order["submitted_at"] = now_utc()
     order["status"] = "WAITING_EXCHANGE_TRIGGER"
     log.info(
-        "STOP_ENTRY_ORDER_SUBMITTED symbol=%s order_id=%s side=%s type=%s stop_price=%s limit_price=%s qty=%s",
+        "BREAKOUT_STOP_ORDER_SUBMITTED symbol=%s order_id=%s side=%s stop_price=%s qty=%s",
         order.get("symbol"),
         order.get("order_id"),
         order.get("side"),
-        execution_type,
         trigger,
-        limit_price,
         qty,
     )
     notify_real_order_submitted(order)
@@ -2116,6 +2306,10 @@ def maybe_create_virtual_order(
         return None
 
     order = create_virtual_order(candidate)
+    breakout_ctx = detect_breakout_context(order, market_ctx)
+    selected_execution = classify_entry_execution(order, market_ctx)
+    order["entry_execution"] = selected_execution
+    _log_entry_execution_decision(order, market_ctx, selected_execution, "ORDER_CREATED", breakout_ctx)
 
     try:
         notify_order_created(order)
@@ -2254,7 +2448,12 @@ def process_existing_order(
                                    ))
 
     if trigger_touched and status in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED", "READY"}:
-        if _should_block_negative_expectancy(order):
+        breakout_ctx = detect_breakout_context(order, market_ctx)
+        selected_execution = classify_entry_execution(order, market_ctx)
+        order["entry_execution"] = selected_execution
+        _log_entry_execution_decision(order, market_ctx, selected_execution, "TRIGGER_TOUCHED", breakout_ctx)
+
+        if selected_execution == "REJECT_NEGATIVE_EXPECTANCY":
             order["status"] = "CANCELLED"
             order["exchange_status"] = "NEGATIVE_EXPECTANCY_BLOCKED"
             order["close_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
@@ -2267,12 +2466,27 @@ def process_existing_order(
                 order.get("adaptive_expectancy"),
                 order.get("adaptive_reason"),
             )
-
             return stamp_updated(order)
 
         distance_pct = _entry_chase_distance_pct(order, safe_float(order.get("live_price")))
         max_chase_pct = max(0.0, safe_float(CONFIG.TRADE.MAX_ENTRY_CHASE_PCT))
         order["entry_chase_distance_pct"] = distance_pct
+        if selected_execution == "REJECT_TOO_LATE":
+            order["status"] = "REJECTED"
+            order["exchange_status"] = "MISSED_BREAKOUT_TOO_FAR"
+            order["close_reason"] = "MISSED_BREAKOUT_TOO_FAR"
+            order["cancel_reason"] = "MISSED_BREAKOUT_TOO_FAR"
+            log.info(
+                "BREAKOUT_CHASE_REJECTED symbol=%s order_id=%s side=%s trigger=%s live=%s distance_pct=%s max_chase_pct=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                order.get("side"),
+                order.get("entry_trigger"),
+                order.get("live_price"),
+                safe_float(breakout_ctx.get("price_distance_pct", 0.0)),
+                safe_float(getattr(CONFIG, "BREAKOUT_MAX_CHASE_PCT", 0.45)),
+            )
+            return stamp_updated(order)
         if distance_pct > max_chase_pct:
             order["status"] = "REJECTED"
             order["exchange_status"] = "MISSED_ENTRY_TOO_FAR"
@@ -2351,8 +2565,17 @@ def process_existing_order(
                 return stamp_updated(order)
 
     if get_order_status(order) == "READY":
+        breakout_ctx = detect_breakout_context(order, market_ctx)
+        selected_execution = classify_entry_execution(order, market_ctx)
+        order["entry_execution"] = selected_execution
 
-        if _should_block_negative_expectancy(order):
+        live_price = safe_float(order.get("live_price"))
+        distance_pct = _entry_chase_distance_pct(order, live_price)
+        max_chase_pct = max(0.0, safe_float(CONFIG.TRADE.MAX_ENTRY_CHASE_PCT))
+        order["entry_chase_distance_pct"] = distance_pct
+        _log_entry_execution_decision(order, market_ctx, selected_execution, "READY_EVALUATION", breakout_ctx)
+
+        if selected_execution == "REJECT_NEGATIVE_EXPECTANCY":
             order["status"] = "CANCELLED"
             order["exchange_status"] = "NEGATIVE_EXPECTANCY_BLOCKED"
             order["close_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
@@ -2367,24 +2590,22 @@ def process_existing_order(
             )
             return stamp_updated(order)
 
-        live_price = safe_float(order.get("live_price"))
-        distance_pct = _entry_chase_distance_pct(order, live_price)
-        max_chase_pct = max(0.0, safe_float(CONFIG.TRADE.MAX_ENTRY_CHASE_PCT))
-        order["entry_chase_distance_pct"] = distance_pct
-        selected_execution = _resolve_ready_execution_type(order)
-        log.info(
-            "ENTRY_EXECUTION_DECISION symbol=%s order_id=%s side=%s setup=%s order_type=%s trigger=%s live=%s distance_pct=%s expectancy=%s selected_execution=%s",
-            order.get("symbol"),
-            order.get("order_id"),
-            order.get("side"),
-            order.get("setup_type"),
-            order.get("order_type"),
-            order.get("entry_trigger"),
-            live_price,
-            distance_pct,
-            safe_float(order.get("adaptive_expectancy")),
-            selected_execution,
-        )
+        if selected_execution == "REJECT_TOO_LATE":
+            order["status"] = "REJECTED"
+            order["exchange_status"] = "MISSED_BREAKOUT_TOO_FAR"
+            order["close_reason"] = "MISSED_BREAKOUT_TOO_FAR"
+            order["cancel_reason"] = "MISSED_BREAKOUT_TOO_FAR"
+            log.info(
+                "BREAKOUT_CHASE_REJECTED symbol=%s order_id=%s side=%s trigger=%s live=%s distance_pct=%s max_chase_pct=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                order.get("side"),
+                order.get("entry_trigger"),
+                live_price,
+                safe_float(breakout_ctx.get("price_distance_pct", 0.0)),
+                safe_float(getattr(CONFIG, "BREAKOUT_MAX_CHASE_PCT", 0.45)),
+            )
+            return stamp_updated(order)
 
         if distance_pct > max_chase_pct:
             order["status"] = "REJECTED"
@@ -2432,19 +2653,23 @@ def process_existing_order(
             order["close_reason"] = reason
             return stamp_updated(order)
 
-        if (
-            bool(CONFIG.TRADE.USE_STOP_ENTRY_ORDERS)
-            and not trigger_touched
-            and _is_breakout_order(order)
-            and not _has_exchange_order_reference(order)
-        ):
-            order = _submit_stop_entry_from_ready(order, open_orders)
-        elif bool(CONFIG.TRADE.USE_STOP_ENTRY_ORDERS) and _has_exchange_order_reference(order):
+        if _has_exchange_order_reference(order):
             log.info("STOP_ENTRY_ALREADY_EXISTS symbol=%s order_id=%s side=%s", order.get("symbol"), order.get("order_id"), order.get("side"))
             order["status"] = "WAITING_EXCHANGE_TRIGGER"
             order = stamp_updated(order)
-        else:
+        elif selected_execution == "BREAKOUT_STOP_MARKET":
+            order = _submit_stop_entry_from_ready(order, open_orders, selected_execution=selected_execution)
+        elif selected_execution in {"BREAKOUT_MARKET", "PULLBACK_MARKET"}:
+            order["order_type"] = "MARKET"
             order = submit_real_order_from_virtual(order)
+        elif selected_execution == "PULLBACK_LIMIT":
+            order["order_type"] = "LIMIT"
+            order = submit_real_order_from_virtual(order)
+        else:
+            order["status"] = "CANCELLED"
+            order["exchange_status"] = "ENTRY_EXECUTION_REJECTED"
+            order["close_reason"] = "ENTRY_EXECUTION_REJECTED"
+            order = stamp_updated(order)
 
     if get_order_status(order) in {"NEW", "PARTIALLY_FILLED", "WAITING_EXCHANGE_TRIGGER"}:
         if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
