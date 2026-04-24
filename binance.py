@@ -10,6 +10,8 @@ from urllib.parse import urlencode
 
 import requests
 
+from config import CONFIG
+from position import log
 from utils import (
     floor_qty_to_step,
     round_price_to_tick,
@@ -401,15 +403,38 @@ def get_top_symbols_by_volume(limit: int = 100, quote: str = "USDT") -> List[str
 # =========================================================
 
 def get_account_info_v3() -> Dict[str, Any]:
-    return _request("GET", "/fapi/v3/account", signed=True)
+    try:
+        return _request("GET", "/fapi/v3/account", signed=True)
+    except Exception as e:
+        log.warning("ACCOUNT_FETCH_FAIL err=%s", repr(e))
+        return {}  # always dict
 
 
 def get_available_balance(asset: str = "USDT") -> float:
     account = get_account_info_v3()
-    for item in account.get("assets", []):
-        if item.get("asset") == asset:
-            return safe_float(item.get("availableBalance"))
-    return 0.0
+    log.info("ACCOUNT_KEYS=%s", list(account.keys()))
+    # --- REAL BALANCE ---
+    try:
+        if "assets" in account:
+            for item in account["assets"]:
+                if item.get("asset") == asset:
+                    balance = safe_float(item.get("availableBalance"))
+
+                    if balance > 0:
+                        log.info("BALANCE_SOURCE=REAL %s=%s", asset, balance)
+                        return balance
+                    else:
+                        raise ValueError("Balance is zero")
+
+        raise ValueError("Invalid account structure")
+
+    except Exception as e:
+        log.warning("REAL_BALANCE_FAIL %s err=%s", asset, repr(e))
+
+    # --- PAPER FALLBACK ---
+    paper_balance = CONFIG.PAPER_BALANCE.get(asset, 100.0)
+    log.warning("BALANCE_SOURCE=PAPER %s=%s", asset, paper_balance)
+    return paper_balance
 
 
 def get_position_risk(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
