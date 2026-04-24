@@ -1584,7 +1584,7 @@ def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tu
 
     try:
         if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
-            account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 1000.0), 1000.0)
+            account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 100.0), 100.0)
         else:
             account_balance = safe_float(binance.get_available_balance("USDT"))
             if account_balance <= 0:

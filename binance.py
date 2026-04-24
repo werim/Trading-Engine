@@ -412,7 +412,7 @@ def get_account_info_v3() -> Dict[str, Any]:
 
 def get_available_balance(asset: str = "USDT") -> float:
     account = get_account_info_v3()
-    log.info("ACCOUNT_KEYS=%s", list(account.keys()))
+    if account: log.info("ACCOUNT_KEYS=%s", list(account.keys()))
     # --- REAL BALANCE ---
     try:
         if "assets" in account:
