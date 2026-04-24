@@ -1392,18 +1392,14 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
     order["executed_qty"] = 0.0
     order["avg_fill_price"] = 0.0
 
-    should_fill = normalize_status(order.get("order_type")) == "MARKET"
-    if not should_fill:
-        if is_breakout:
-            if side == "LONG" and live_high >= trigger:
-                should_fill = True
-            elif side == "SHORT" and live_low <= trigger:
-                should_fill = True
-        else:
-            if side == "LONG" and live_low <= trigger:
-                should_fill = True
-            elif side == "SHORT" and live_high >= trigger:
-                should_fill = True
+    should_fill = _should_fill_pending_order(
+        side=side,
+        order_type=normalize_status(order.get("order_type")),
+        is_breakout=is_breakout,
+        trigger=trigger,
+        live_high=live_high,
+        live_low=live_low,
+    )
 
     log.info(
         "ORDER_PAPER_FILL_CHECK symbol=%s order_id=%s status=%s side=%s type=%s breakout=%s trigger=%s live=%s high=%s low=%s eligible=%s",
@@ -1465,13 +1461,14 @@ def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
     order_type = normalize_status(order.get("order_type"))
     is_breakout = _is_breakout_order(order)
 
-    should_fill = order_type == "MARKET"
-    if not should_fill:
-        if is_breakout:
-            should_fill = (side == "LONG" and live_high >= trigger) or (side == "SHORT" and live_low <= trigger)
-        else:
-            should_fill = (side == "LONG" and live_low <= trigger) or (side == "SHORT" and live_high >= trigger)
-
+    should_fill = _should_fill_pending_order(
+        side=side,
+        order_type=order_type,
+        is_breakout=is_breakout,
+        trigger=trigger,
+        live_high=live_high,
+        live_low=live_low,
+    )
     log.info(
         "ORDER_PAPER_RECONCILE_CHECK symbol=%s order_id=%s side=%s type=%s breakout=%s trigger=%s live=%s high=%s low=%s eligible=%s",
         order.get("symbol"),
@@ -1513,6 +1510,23 @@ def _ceil_qty_to_step(qty: float, step_size: float) -> float:
     return float((Decimal(str(qty)) / Decimal(str(step_size))).quantize(
         Decimal("1"), rounding=ROUND_UP
     ) * Decimal(str(step_size)))
+
+
+def _should_fill_pending_order(
+    side: str,
+    order_type: str,
+    is_breakout: bool,
+    trigger: float,
+    live_high: float,
+    live_low: float,
+) -> bool:
+    if order_type == "MARKET":
+        return True
+    if trigger <= 0:
+        return False
+    if is_breakout:
+        return (side == "LONG" and live_high >= trigger) or (side == "SHORT" and live_low <= trigger)
+    return (side == "LONG" and live_low <= trigger) or (side == "SHORT" and live_high >= trigger)
 
 
 def _log_qty_diagnostics(order: Dict[str, Any], diag: Dict[str, Any], reason: str) -> None:
@@ -1572,7 +1586,9 @@ def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tu
         if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
             account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 1000.0), 1000.0)
         else:
-            account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 100.0), 100.0)
+            account_balance = safe_float(binance.get_available_balance("USDT"))
+            if account_balance <= 0:
+                account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 100.0), 100.0)
     except Exception:
         _log_qty_diagnostics(order, diag, "QTY_BALANCE_FETCH_FAIL")
         send_telegram_message(f"{order['symbol']} QTY_BALANCE_FETCH_FAIL")
@@ -1962,7 +1978,8 @@ def process_existing_order(
         if trigger_touched:
             if int(order.get("entry_trigger_touched", 0)) != 1:
                 log.info(
-                    "+                    "+                    "+ type=%s setup=%s trigger=%s live=%s high=%s low=%s status=%s",
+                    "ENTRY_TRIGGER_TOUCHED symbol=%s order_id=%s side=%s type=%s setup=%s trigger=%s live=%s high=%s "
+                    "low=%s status=%s",
                     order.get("symbol"),
                     order.get("order_id"),
                     order.get("side"),
@@ -1974,11 +1991,26 @@ def process_existing_order(
                     order.get("live_low"),
                     status,
                 )
+                send_telegram_message("ENTRY_TRIGGER_TOUCHED symbol=%s order_id=%s side=%s type=%s setup=%s trigger=%s "
+                                      "live=%s high=%s low=%s status=%s"%
+                                      (order.get("symbol"),
+                                      order.get("order_id"),
+                                      order.get("side"),
+                                      order.get("order_type"),
+                                      order.get("setup_type"),
+                                      order.get("entry_trigger"),
+                                      order.get("live_price"),
+                                      order.get("live_high"),
+                                      order.get("live_low"),
+                                      status,
+                                      ))
             order["entry_trigger_touched"] = 1
             order["entry_trigger_touched_at"] = order.get("entry_trigger_touched_at") or now_utc()
-        elif int(order.get("entry_trigger_skipped_logged", 0)) != 1 and status in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED"}:
+        elif int(order.get("entry_trigger_skipped_logged", 0)) != 1 and status in {"WATCHING", "WATCHING_RETRACE",
+                                                                                   "wAITING_RETRACE", "PLANNED"}:
             log.info(
-                "ENTRY_TRIGGER_SKIPPED symbol=%s order_id=%s side=%s type=%s setup=%s trigger=%s live=%s high=%s low=%s status=%s",
+                "ENTRY_TRIGGER_SKIPPED symbol=%s order_id=%s side=%s type=%s setup=%s trigger=%s live=%s high=%s "
+                "low=%s status=%s",
                 order.get("symbol"),
                 order.get("order_id"),
                 order.get("side"),
@@ -1991,6 +2023,20 @@ def process_existing_order(
                 status,
             )
             order["entry_trigger_skipped_logged"] = 1
+
+            send_telegram_message("ENTRY_TRIGGER_SKIPPED symbol=%s order_id=%s side=%s type=%s setup=%s trigger=%s "
+                                  "live=%s high=%s low=%s status=%s" %
+                                  (order.get("symbol"),
+                                   order.get("order_id"),
+                                   order.get("side"),
+                                   order.get("order_type"),
+                                   order.get("setup_type"),
+                                   order.get("entry_trigger"),
+                                   order.get("live_price"),
+                                   order.get("live_high"),
+                                   order.get("live_low"),
+                                   status,
+                                   ))
 
     if trigger_touched and status in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED", "READY"}:
         adaptive_reason = normalize_status(order.get("adaptive_reason"))

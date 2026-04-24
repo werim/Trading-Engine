@@ -43,6 +43,15 @@ def position_is_open(position: Dict[str, Any]) -> bool:
     return normalize_status(position.get("status")) in OPEN_POSITION_STATUSES
 
 
+def _position_progress_r(position: Dict[str, Any]) -> float:
+    return calc_progress_r(
+        entry=safe_float(position["entry"]),
+        sl=safe_float(position["sl"]),
+        live_price=safe_float(position["live_price"]),
+        side=position["side"],
+    )
+
+
 def build_position_from_filled_order(order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     symbol = order.get("symbol", "")
     side = order.get("side", "")
@@ -265,12 +274,7 @@ def maybe_take_partial(position: Dict[str, Any]) -> Dict[str, Any]:
     if str(position.get("partial_taken")) == "1":
         return position
 
-    progress_r = calc_progress_r(
-        entry=safe_float(position["entry"]),
-        sl=safe_float(position["sl"]),
-        live_price=safe_float(position["live_price"]),
-        side=position["side"],
-    )
+    progress_r = _position_progress_r(position)
     if progress_r < CONFIG.TRADE.PARTIAL_TP_AT_R:
         return position
 
@@ -296,12 +300,7 @@ def maybe_move_to_break_even(position: Dict[str, Any]) -> Dict[str, Any]:
     if str(position.get("break_even_armed")) == "1":
         return position
 
-    progress_r = calc_progress_r(
-        entry=safe_float(position["entry"]),
-        sl=safe_float(position["sl"]),
-        live_price=safe_float(position["live_price"]),
-        side=position["side"],
-    )
+    progress_r = _position_progress_r(position)
     if progress_r < CONFIG.TRADE.BREAK_EVEN_TRIGGER_R:
         return position
 
@@ -319,12 +318,7 @@ def maybe_trail_stop(position: Dict[str, Any]) -> Dict[str, Any]:
 
     entry = safe_float(position["entry"])
     current_sl = safe_float(position["sl"])
-    progress_r = calc_progress_r(
-        entry=entry,
-        sl=current_sl,
-        live_price=safe_float(position["live_price"]),
-        side=position["side"],
-    )
+    progress_r = _position_progress_r(position)
     trail_after_r = CONFIG.TRADE.TRAIL_AFTER_R
     if str(position.get("news_tp_policy", "")) == "widen_or_trail":
         trail_after_r = max(1.0, trail_after_r - 0.5)
