@@ -2,6 +2,7 @@ from __future__ import annotations
 from event_miner import build_event_key, get_event_stats
 from market import _get_market_context_from_local_cache
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_UP
 from typing import Any, Dict, List, Optional, Tuple
 import csv
 import os
@@ -21,6 +22,7 @@ from logger import get_logger
 from notifier import notify_order_created, notify_real_order_submitted
 from utils import (
     calc_rr,
+    floor_qty_to_step,
     is_order_expired,
     is_same_order_intent,
     make_client_order_id,
@@ -33,6 +35,8 @@ from utils import (
 ACTIVE_ORDER_STATUSES = {
     "PLANNED",
     "WATCHING",
+    "WATCHING_RETRACE",
+    "WAITING_RETRACE",
     "READY",
     "NEW",
     "PARTIALLY_FILLED",
@@ -1138,7 +1142,7 @@ def update_virtual_order_market_state(order: Dict[str, Any], market_ctx: Dict[st
                     order["drift_pct"] = drift_pct
                     return stamp_updated(order)
 
-    if get_order_status(order) in {"WATCHING", "PLANNED"}:
+    if get_order_status(order) in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED"}:
         order["watch_reason"] = order.get("watch_reason") or "WAITING_ENTRY_ZONE"
 
     return stamp_updated(order)
@@ -1174,6 +1178,10 @@ def _order_entry_type(order: Dict[str, Any]) -> str:
     return normalize_status(order.get("entry_type"))
 
 
+def _is_retrace_entry(order: Dict[str, Any]) -> bool:
+    return int(order.get("retrace_entry", 0)) == 1
+
+
 def _is_breakout_order(order: Dict[str, Any]) -> bool:
     setup_type = _order_setup_type(order)
     setup_reason = normalize_status(order.get("setup_reason"))
@@ -1189,11 +1197,130 @@ def _is_breakout_order(order: Dict[str, Any]) -> bool:
 
 
 def _is_pullback_like_order(order: Dict[str, Any]) -> bool:
-    return not _is_breakout_order(order)
+    return _is_retrace_entry(order) or not _is_breakout_order(order)
 
 
 def _is_a_plus_order(order: Dict[str, Any]) -> bool:
     return "A_PLUS" in normalize_status(order.get("market_event_reason"))
+
+
+def is_entry_triggered(order: Dict[str, Any], candle_or_market_ctx: Dict[str, Any]) -> bool:
+    trigger = safe_float(order.get("entry_trigger"))
+    if trigger <= 0:
+        return False
+
+    live_price = safe_float(candle_or_market_ctx.get("last_price", order.get("live_price", 0.0)))
+    high_candidates = [
+        live_price,
+        safe_float(candle_or_market_ctx.get("last_1m_high", 0.0)),
+        safe_float(candle_or_market_ctx.get("candle_high", 0.0)),
+        safe_float(candle_or_market_ctx.get("high", 0.0)),
+        safe_float(order.get("live_high", 0.0)),
+    ]
+    low_candidates = [
+        live_price,
+        safe_float(candle_or_market_ctx.get("last_1m_low", 0.0)),
+        safe_float(candle_or_market_ctx.get("candle_low", 0.0)),
+        safe_float(candle_or_market_ctx.get("low", 0.0)),
+        safe_float(order.get("live_low", 0.0)),
+    ]
+    high_candidates = [v for v in high_candidates if v > 0]
+    low_candidates = [v for v in low_candidates if v > 0]
+    live_high = max(high_candidates) if high_candidates else live_price
+    live_low = min(low_candidates) if low_candidates else live_price
+
+    side = normalize_status(order.get("side"))
+    if _is_breakout_order(order) and not _is_retrace_entry(order):
+        if side == "LONG":
+            return live_high >= trigger or live_price >= trigger
+        if side == "SHORT":
+            return live_low <= trigger or live_price <= trigger
+        return False
+
+    if side == "LONG":
+        return live_low <= trigger
+    if side == "SHORT":
+        return live_high >= trigger
+    return False
+
+
+def should_override_negative_expectancy(order: Dict[str, Any]) -> bool:
+    if not _is_a_plus_order(order):
+        return False
+
+    expectancy = safe_float(order.get("adaptive_expectancy"))
+    sample_size = int(safe_float(order.get("adaptive_sample_size", 0)))
+    event_wr = safe_float(order.get("market_event_winrate"))
+    event_n = int(safe_float(order.get("market_event_sample_size", 0)))
+
+    if expectancy >= 0:
+        return False
+    if event_wr < safe_float(CONFIG.TRADE.A_PLUS_EXPECTANCY_OVERRIDE_MIN_WINRATE):
+        return False
+    if event_n < int(CONFIG.TRADE.A_PLUS_EXPECTANCY_OVERRIDE_MIN_SAMPLE_SIZE):
+        return False
+    if sample_size <= 0:
+        return False
+    return True
+
+
+def should_block_spike_chase(order: Dict[str, Any], market_ctx: Dict[str, Any]) -> bool:
+    if normalize_status(order.get("order_type")) != "MARKET":
+        return False
+    if not _is_breakout_order(order):
+        return False
+
+    event_type = _normalize_event_type(order.get("market_event_type"))
+    return_bucket = _normalize_bucket(order.get("market_event_return_bucket"))
+    if not event_type:
+        event_type = _normalize_event_type((market_ctx.get("market_event") or {}).get("event_type"))
+    if not return_bucket:
+        return_bucket = _normalize_bucket((market_ctx.get("market_event") or {}).get("return_bucket"))
+
+    side = normalize_status(order.get("side"))
+    trigger = safe_float(order.get("entry_trigger"))
+    live_price = safe_float(market_ctx.get("last_price", order.get("live_price", 0.0)))
+    if trigger <= 0 or live_price <= 0:
+        return False
+
+    chase_distance_pct = abs(live_price - trigger) / trigger * 100.0
+    max_chase_pct = max(0.0, safe_float(CONFIG.TRADE.MAX_MARKET_CHASE_DISTANCE_PCT))
+    order["market_chase_distance_pct"] = chase_distance_pct
+
+    spike_event_match = (
+        (side == "LONG" and event_type == "price_spike_up" and return_bucket == "sharp_up")
+        or (side == "SHORT" and event_type == "price_spike_down" and return_bucket == "sharp_down")
+    )
+    return spike_event_match and chase_distance_pct >= max_chase_pct
+
+
+def convert_to_retrace_entry(order: Dict[str, Any], market_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    retrace_pct = max(0.0, safe_float(CONFIG.TRADE.SPIKE_RETRACE_PCT)) / 100.0
+    live_price = safe_float(market_ctx.get("last_price", order.get("live_price", 0.0)))
+    trigger = safe_float(order.get("entry_trigger"))
+    side = normalize_status(order.get("side"))
+    current_zone_low = safe_float(order.get("entry_zone_low"))
+    current_zone_high = safe_float(order.get("entry_zone_high"))
+
+    if side == "LONG":
+        retrace_trigger = live_price * (1.0 - retrace_pct)
+        retrace_trigger = min(trigger, retrace_trigger) if trigger > 0 else retrace_trigger
+    else:
+        retrace_trigger = live_price * (1.0 + retrace_pct)
+        retrace_trigger = max(trigger, retrace_trigger) if trigger > 0 else retrace_trigger
+
+    zone_pad = abs(retrace_trigger) * 0.0008
+    order["order_type"] = "LIMIT"
+    order["entry_type"] = "BREAKOUT_RETRACE"
+    order["retrace_entry"] = 1
+    order["retrace_anchor_price"] = live_price
+    order["entry_trigger"] = retrace_trigger
+    order["entry_zone_low"] = min(retrace_trigger - zone_pad, current_zone_low or retrace_trigger)
+    order["entry_zone_high"] = max(retrace_trigger + zone_pad, current_zone_high or retrace_trigger)
+    order["status"] = "WAITING_RETRACE"
+    order["watch_reason"] = "WAITING_RETRACE_ENTRY"
+    order["exchange_status"] = "RETRACE_ENTRY_CREATED"
+    return stamp_updated(order)
 
 
 def _priority_rank(order: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
@@ -1219,7 +1346,7 @@ def _preempt_weaker_orders_if_needed(order: Dict[str, Any], open_orders: List[Di
     watchers = []
     for other in active_orders:
         status = get_order_status(other)
-        if status not in {"WATCHING", "PLANNED"}:
+        if status not in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED"}:
             continue
         if _priority_rank(other) >= incoming_rank:
             continue
@@ -1378,18 +1505,144 @@ def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
     return stamp_updated(order)
 
 
-def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tuple[float, Optional[str]]:
-    if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
-        account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 300.0), 300.0)
-    else:
-        account_balance = binance.get_available_balance("USDT")
-    qty = risk.calc_position_size(
-        entry=safe_float(order["entry_trigger"]),
-        sl=safe_float(order["sl"]),
-        account_balance=account_balance,
-        risk_pct=CONFIG.TRADE.RISK_PER_TRADE_PCT,
-        symbol_meta=symbol_meta,
+def _ceil_qty_to_step(qty: float, step_size: float) -> float:
+    if qty <= 0:
+        return 0.0
+    if step_size <= 0:
+        return qty
+    return float((Decimal(str(qty)) / Decimal(str(step_size))).quantize(
+        Decimal("1"), rounding=ROUND_UP
+    ) * Decimal(str(step_size)))
+
+
+def _log_qty_diagnostics(order: Dict[str, Any], diag: Dict[str, Any], reason: str) -> None:
+    log.info(
+        "ORDER_QTY_DIAGNOSTIC symbol=%s side=%s type=%s entry=%s stop_loss=%s mark_last=%s account_balance=%s risk_pct=%s risk_amount=%s risk_per_unit=%s raw_qty=%s step_size=%s min_qty=%s min_notional=%s rounded_qty=%s notional=%s reason=%s",
+        order.get("symbol"),
+        order.get("side"),
+        order.get("order_type"),
+        diag.get("entry", 0.0),
+        diag.get("stop_loss", 0.0),
+        diag.get("mark_last_price", 0.0),
+        diag.get("account_balance", 0.0),
+        diag.get("risk_pct", 0.0),
+        diag.get("risk_amount", 0.0),
+        diag.get("risk_per_unit", 0.0),
+        diag.get("raw_qty", 0.0),
+        diag.get("step_size", 0.0),
+        diag.get("min_qty", 0.0),
+        diag.get("min_notional", 0.0),
+        diag.get("rounded_qty", 0.0),
+        diag.get("notional", 0.0),
+        reason,
     )
+
+
+def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tuple[float, Optional[str]]:
+    diag: Dict[str, Any] = {
+        "entry": safe_float(order.get("entry_trigger")),
+        "stop_loss": safe_float(order.get("sl")),
+        "mark_last_price": safe_float(order.get("live_price")),
+        "risk_pct": safe_float(CONFIG.TRADE.RISK_PER_TRADE_PCT),
+        "step_size": 0.0,
+        "min_qty": 0.0,
+        "min_notional": 0.0,
+        "account_balance": 0.0,
+        "risk_amount": 0.0,
+        "risk_per_unit": 0.0,
+        "raw_qty": 0.0,
+        "rounded_qty": 0.0,
+        "notional": 0.0,
+    }
+
+    if not symbol_meta:
+        _log_qty_diagnostics(order, diag, "QTY_SYMBOL_META_MISSING")
+        return 0.0, "QTY_SYMBOL_META_MISSING"
+
+    order_type = normalize_status(order.get("order_type"))
+    step_size = safe_float(symbol_meta.get("market_step_size" if order_type == "MARKET" else "step_size"))
+    min_qty = safe_float(symbol_meta.get("market_min_qty" if order_type == "MARKET" else "min_qty"))
+    min_notional = safe_float(symbol_meta.get("min_notional"))
+    if step_size <= 0:
+        step_size = safe_float(symbol_meta.get("step_size"))
+    if min_qty <= 0:
+        min_qty = safe_float(symbol_meta.get("min_qty"))
+    diag["step_size"] = step_size
+    diag["min_qty"] = min_qty
+    diag["min_notional"] = min_notional
+
+    if step_size <= 0:
+        _log_qty_diagnostics(order, diag, "QTY_SYMBOL_META_MISSING")
+        return 0.0, "QTY_SYMBOL_META_MISSING"
+
+    try:
+        if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
+            account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 300.0), 300.0)
+        else:
+            account_balance = safe_float(binance.get_available_balance("USDT"))
+    except Exception:
+        _log_qty_diagnostics(order, diag, "QTY_BALANCE_FETCH_FAIL")
+        return 0.0, "QTY_BALANCE_FETCH_FAIL"
+
+    diag["account_balance"] = account_balance
+    if account_balance <= 0:
+        _log_qty_diagnostics(order, diag, "QTY_BALANCE_ZERO")
+        return 0.0, "QTY_BALANCE_ZERO"
+
+    entry = diag["entry"]
+    stop_loss = diag["stop_loss"]
+    if entry <= 0 or stop_loss <= 0:
+        _log_qty_diagnostics(order, diag, "QTY_INVALID_ENTRY_OR_SL")
+        return 0.0, "QTY_INVALID_ENTRY_OR_SL"
+
+    risk_amount = account_balance * (diag["risk_pct"] / 100.0)
+    diag["risk_amount"] = risk_amount
+    if risk_amount <= 0:
+        _log_qty_diagnostics(order, diag, "QTY_RISK_AMOUNT_ZERO")
+        return 0.0, "QTY_RISK_AMOUNT_ZERO"
+
+    risk_per_unit = abs(entry - stop_loss)
+    diag["risk_per_unit"] = risk_per_unit
+    if risk_per_unit <= 0:
+        _log_qty_diagnostics(order, diag, "QTY_INVALID_ENTRY_OR_SL")
+        return 0.0, "QTY_INVALID_ENTRY_OR_SL"
+
+    stop_pct = (risk_per_unit / entry) * 100.0
+    diag["stop_pct"] = stop_pct
+    if stop_pct < 0.08:
+        _log_qty_diagnostics(order, diag, "QTY_STOP_TOO_TIGHT")
+        return 0.0, "QTY_STOP_TOO_TIGHT"
+    if stop_pct > 4.0:
+        _log_qty_diagnostics(order, diag, "QTY_STOP_TOO_WIDE")
+        return 0.0, "QTY_STOP_TOO_WIDE"
+
+    raw_qty = risk_amount / risk_per_unit
+    rounded_qty = floor_qty_to_step(raw_qty, step_size)
+    diag["raw_qty"] = raw_qty
+    diag["rounded_qty"] = rounded_qty
+    if rounded_qty <= 0:
+        _log_qty_diagnostics(order, diag, "QTY_STEP_ROUND_ZERO")
+        return 0.0, "QTY_STEP_ROUND_ZERO"
+    if min_qty > 0 and rounded_qty < min_qty:
+        _log_qty_diagnostics(order, diag, "QTY_MIN_QTY_FAIL")
+        return 0.0, "QTY_MIN_QTY_FAIL"
+
+    notional_price = entry if entry > 0 else diag["mark_last_price"]
+    notional = rounded_qty * max(notional_price, 0.0)
+    diag["notional"] = notional
+    if min_notional > 0 and notional < min_notional:
+        min_notional_qty = _ceil_qty_to_step(min_notional / max(notional_price, 1e-12), step_size)
+        diag["min_notional_qty"] = min_notional_qty
+        if min_notional_qty <= raw_qty:
+            rounded_qty = min_notional_qty
+            notional = rounded_qty * notional_price
+            diag["rounded_qty"] = rounded_qty
+            diag["notional"] = notional
+        else:
+            _log_qty_diagnostics(order, diag, "QTY_MIN_NOTIONAL_FAIL")
+            return 0.0, "QTY_MIN_NOTIONAL_FAIL"
+
+    qty = rounded_qty
     size_mult = safe_float(order.get("size_mult", 1.0), 1.0)
     score = safe_float(order.get("score"))
     score_mult = 0.70 + min(0.60, max(0.0, (score - CONFIG.FILTER.MIN_SCORE) * 0.06))
@@ -1400,9 +1653,20 @@ def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tu
     if "STOP_TOO_WIDE" in soft_flags:
         size_mult *= 0.75
     if size_mult > 0:
-        qty *= size_mult
+        qty = floor_qty_to_step(qty * size_mult, step_size)
+        diag["rounded_qty"] = qty
+        diag["notional"] = qty * max(notional_price, 0.0)
     if qty <= 0:
-        return 0.0, "QTY_LE_ZERO"
+        _log_qty_diagnostics(order, diag, "QTY_STEP_ROUND_ZERO")
+        return 0.0, "QTY_STEP_ROUND_ZERO"
+    if min_qty > 0 and qty < min_qty:
+        _log_qty_diagnostics(order, diag, "QTY_MIN_QTY_FAIL")
+        return 0.0, "QTY_MIN_QTY_FAIL"
+    if min_notional > 0 and diag["notional"] < min_notional:
+        _log_qty_diagnostics(order, diag, "QTY_MIN_NOTIONAL_FAIL")
+        return 0.0, "QTY_MIN_NOTIONAL_FAIL"
+
+    _log_qty_diagnostics(order, diag, "QTY_OK")
     return qty, None
 
 
@@ -1458,6 +1722,16 @@ def submit_real_order_from_virtual(order: Dict[str, Any]) -> Dict[str, Any]:
     order["submitted_qty"] = qty
     order = _ensure_client_order_id(order)
     log.info(
+        "MARKET_SUBMIT_ATTEMPT symbol=%s order_id=%s side=%s type=%s trigger=%s live=%s qty=%s",
+        order.get("symbol"),
+        order.get("order_id"),
+        order.get("side"),
+        order.get("order_type"),
+        order.get("entry_trigger"),
+        order.get("live_price"),
+        qty,
+    )
+    log.info(
         "ORDER_SUBMIT_TRANSITION symbol=%s order_id=%s side=%s type=%s status=%s zone_touched=%s trigger=%s live=%s high=%s low=%s adaptive_reason=%s",
         order.get("symbol"),
         order.get("order_id"),
@@ -1473,7 +1747,17 @@ def submit_real_order_from_virtual(order: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
-        return _paper_fill_or_queue(order)
+        updated = _paper_fill_or_queue(order)
+        log.info(
+            "MARKET_SUBMIT_SUCCESS symbol=%s order_id=%s side=%s type=%s status=%s exchange_status=%s",
+            updated.get("symbol"),
+            updated.get("order_id"),
+            updated.get("side"),
+            updated.get("order_type"),
+            updated.get("status"),
+            updated.get("exchange_status"),
+        )
+        return updated
 
     try:
         resp = _submit_real_exchange_order(order, qty)
@@ -1490,6 +1774,14 @@ def submit_real_order_from_virtual(order: Dict[str, Any]) -> Dict[str, Any]:
         order["status"] = "FAILED"
         order["exchange_status"] = f"SUBMIT_ERROR:{type(exc).__name__}:{str(exc)}"
         order["submit_error_detail"] = str(exc)
+        log.info(
+            "MARKET_SUBMIT_FAIL symbol=%s order_id=%s side=%s type=%s err=%s",
+            order.get("symbol"),
+            order.get("order_id"),
+            order.get("side"),
+            order.get("order_type"),
+            type(exc).__name__,
+        )
         return stamp_updated(order)
 
     order["exchange_order_id"] = resp.get("orderId", order.get("exchange_order_id", ""))
@@ -1502,6 +1794,15 @@ def submit_real_order_from_virtual(order: Dict[str, Any]) -> Dict[str, Any]:
         order["status"] = "NEW"
 
     order = stamp_updated(order)
+    log.info(
+        "MARKET_SUBMIT_SUCCESS symbol=%s order_id=%s side=%s type=%s status=%s exchange_status=%s",
+        order.get("symbol"),
+        order.get("order_id"),
+        order.get("side"),
+        order.get("order_type"),
+        order.get("status"),
+        order.get("exchange_status"),
+    )
     notify_real_order_submitted(order)
     return order
 
@@ -1661,9 +1962,116 @@ def process_existing_order(
         return order
 
     order = update_virtual_order_market_state(order, market_ctx)
+    status = get_order_status(order)
+    trigger_touched = is_entry_triggered(order, market_ctx)
+    if status in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED", "READY"}:
+        if trigger_touched:
+            if int(order.get("entry_trigger_touched", 0)) != 1:
+                log.info(
+                    "+                    "+                    "+ type=%s setup=%s trigger=%s live=%s high=%s low=%s status=%s",
+                    order.get("symbol"),
+                    order.get("order_id"),
+                    order.get("side"),
+                    order.get("order_type"),
+                    order.get("setup_type"),
+                    order.get("entry_trigger"),
+                    order.get("live_price"),
+                    order.get("live_high"),
+                    order.get("live_low"),
+                    status,
+                )
+            order["entry_trigger_touched"] = 1
+            order["entry_trigger_touched_at"] = order.get("entry_trigger_touched_at") or now_utc()
+        elif int(order.get("entry_trigger_skipped_logged", 0)) != 1 and status in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED"}:
+            log.info(
+                "ENTRY_TRIGGER_SKIPPED symbol=%s order_id=%s side=%s type=%s setup=%s trigger=%s live=%s high=%s low=%s status=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                order.get("side"),
+                order.get("order_type"),
+                order.get("setup_type"),
+                order.get("entry_trigger"),
+                order.get("live_price"),
+                order.get("live_high"),
+                order.get("live_low"),
+                status,
+            )
+            order["entry_trigger_skipped_logged"] = 1
+
+    if trigger_touched and status in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED", "READY"}:
+        adaptive_reason = normalize_status(order.get("adaptive_reason"))
+        blocked_negative_expectancy = (
+            "BLOCK_NEGATIVE_EXPECTANCY" in adaptive_reason
+            or (
+                int(order.get("adaptive_sample_size", 0)) > 0
+                and safe_float(order.get("adaptive_expectancy")) < 0
+                and bool(CONFIG.FILTER.STRICT_EXPECTANCY_BLOCK)
+            )
+        )
+        if blocked_negative_expectancy:
+            if should_override_negative_expectancy(order):
+                order["expectancy_override"] = "A_PLUS_EXPECTANCY_OVERRIDE"
+                log.info(
+                    "A_PLUS_EXPECTANCY_OVERRIDE symbol=%s order_id=%s side=%s expectancy=%s event_wr=%s event_n=%s",
+                    order.get("symbol"),
+                    order.get("order_id"),
+                    order.get("side"),
+                    order.get("adaptive_expectancy"),
+                    order.get("market_event_winrate"),
+                    order.get("market_event_sample_size"),
+                )
+            else:
+                order["status"] = "CANCELLED"
+                order["exchange_status"] = "NEGATIVE_EXPECTANCY_BLOCKED"
+                order["close_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
+                order["cancel_reason"] = "BLOCK_NEGATIVE_EXPECTANCY"
+                log.info(
+                    "NEGATIVE_EXPECTANCY_BLOCKED symbol=%s order_id=%s side=%s expectancy=%s reason=%s",
+                    order.get("symbol"),
+                    order.get("order_id"),
+                    order.get("side"),
+                    order.get("adaptive_expectancy"),
+                    order.get("adaptive_reason"),
+                )
+                return stamp_updated(order)
+
+        if should_block_spike_chase(order, market_ctx):
+            if bool(CONFIG.TRADE.ENABLE_SPIKE_RETRACE_ENTRY):
+                order = convert_to_retrace_entry(order, market_ctx)
+                log.info(
+                    "RETRACE_ENTRY_CREATED symbol=%s order_id=%s side=%s old_type=MARKET new_type=%s retrace_trigger=%s anchor=%s",
+                    order.get("symbol"),
+                    order.get("order_id"),
+                    order.get("side"),
+                    order.get("order_type"),
+                    order.get("entry_trigger"),
+                    order.get("retrace_anchor_price"),
+                )
+                return order
+            order["status"] = "CANCELLED"
+            order["exchange_status"] = "SPIKE_CHASE_BLOCKED"
+            order["close_reason"] = "SPIKE_CHASE_BLOCKED"
+            order["cancel_reason"] = "SPIKE_CHASE_BLOCKED"
+            log.info(
+                "SPIKE_CHASE_BLOCKED symbol=%s order_id=%s side=%s trigger=%s live=%s chase_pct=%s event=%s/%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                order.get("side"),
+                order.get("entry_trigger"),
+                order.get("live_price"),
+                order.get("market_chase_distance_pct", 0.0),
+                order.get("market_event_type"),
+                order.get("market_event_return_bucket"),
+            )
+            return stamp_updated(order)
+
+        if get_order_status(order) in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED"}:
+            order["status"] = "READY"
+            order["watch_reason"] = "ENTRY_TRIGGERED_READY"
+            status = "READY"
 
     current_event = _extract_market_event(market_ctx)
-    if get_order_status(order) in {"WATCHING", "PLANNED", "READY"}:
+    if get_order_status(order) in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED", "READY"}:
         current_event_type = current_event.get("event_type", "")
         if current_event_type in BAD_EVENT_TYPES:
             order["status"] = "CANCELLED"
@@ -1673,7 +2081,7 @@ def process_existing_order(
 
     status = get_order_status(order)
 
-    if status in {"WATCHING", "PLANNED"}:
+    if status in {"WATCHING", "WATCHING_RETRACE", "WAITING_RETRACE", "PLANNED"}:
         age_min = get_order_age_minutes(order)
         if age_min > 240:
             if _is_breakout_order(order):
