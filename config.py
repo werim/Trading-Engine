@@ -58,10 +58,10 @@ class FilterConfig:
     MIN_RR: float = _get_float("MIN_RR", "1.6")
     MIN_24H_VOLUME_USDT: float = _get_float("MIN_24H_VOLUME_USDT", "20000000")
     MAX_SPREAD_PCT: float = _get_float("MAX_SPREAD_PCT", "0.15")
-    MIN_EXPECTED_NET_PNL_PCT: float = _get_float("MIN_EXPECTED_NET_PNL_PCT", "0.35")
+    MIN_EXPECTED_NET_PNL_PCT: float = _get_float("MIN_EXPECTED_NET_PNL_PCT", "0.55")
     MAX_FUNDING_RATE_PCT: float = _get_float("MAX_FUNDING_RATE_PCT", "0.05")
     MIN_ADAPTIVE_EXPECTANCY: float = _get_float("MIN_ADAPTIVE_EXPECTANCY", "0.0")
-    STRICT_EXPECTANCY_BLOCK: bool = _get_bool("STRICT_EXPECTANCY_BLOCK", "1")
+    STRICT_EXPECTANCY_BLOCK: bool = _get_bool("STRICT_EXPECTANCY_BLOCK", "0")
 
 
 @dataclass(frozen=True)

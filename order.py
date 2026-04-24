@@ -19,7 +19,7 @@ import order_planner_sniper as order_planner
 import scenario_engine_sniper as scenario_engine
 from config import CONFIG
 from logger import get_logger
-from notifier import notify_order_created, notify_real_order_submitted
+from notifier import notify_order_created, notify_real_order_submitted, send_telegram_message
 from utils import (
     calc_rr,
     floor_qty_to_step,
@@ -1516,26 +1516,19 @@ def _ceil_qty_to_step(qty: float, step_size: float) -> float:
 
 
 def _log_qty_diagnostics(order: Dict[str, Any], diag: Dict[str, Any], reason: str) -> None:
-    log.info(
-        "ORDER_QTY_DIAGNOSTIC symbol=%s side=%s type=%s entry=%s stop_loss=%s mark_last=%s account_balance=%s risk_pct=%s risk_amount=%s risk_per_unit=%s raw_qty=%s step_size=%s min_qty=%s min_notional=%s rounded_qty=%s notional=%s reason=%s",
-        order.get("symbol"),
-        order.get("side"),
-        order.get("order_type"),
-        diag.get("entry", 0.0),
-        diag.get("stop_loss", 0.0),
-        diag.get("mark_last_price", 0.0),
-        diag.get("account_balance", 0.0),
-        diag.get("risk_pct", 0.0),
-        diag.get("risk_amount", 0.0),
-        diag.get("risk_per_unit", 0.0),
-        diag.get("raw_qty", 0.0),
-        diag.get("step_size", 0.0),
-        diag.get("min_qty", 0.0),
-        diag.get("min_notional", 0.0),
-        diag.get("rounded_qty", 0.0),
-        diag.get("notional", 0.0),
-        reason,
+    msg = (
+        f"ORDER_QTY_DIAGNOSTIC "
+        f"symbol={order.get('symbol')} side={order.get('side')} type={order.get('order_type')} "
+        f"entry={diag.get('entry', 0.0)} stop_loss={diag.get('stop_loss', 0.0)} "
+        f"mark_last={diag.get('mark_last_price', 0.0)} account_balance={diag.get('account_balance', 0.0)} "
+        f"risk_pct={diag.get('risk_pct', 0.0)} risk_amount={diag.get('risk_amount', 0.0)} "
+        f"risk_per_unit={diag.get('risk_per_unit', 0.0)} raw_qty={diag.get('raw_qty', 0.0)} "
+        f"step_size={diag.get('step_size', 0.0)} min_qty={diag.get('min_qty', 0.0)} "
+        f"min_notional={diag.get('min_notional', 0.0)} rounded_qty={diag.get('rounded_qty', 0.0)} "
+        f"notional={diag.get('notional', 0.0)} reason={reason}"
     )
+    log.info(msg)
+    send_telegram_message(msg[:150])
 
 
 def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tuple[float, Optional[str]]:
@@ -1577,11 +1570,12 @@ def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tu
 
     try:
         if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
-            account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 300.0), 300.0)
+            account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 1000.0), 1000.0)
         else:
-            account_balance = safe_float(binance.get_available_balance("USDT"))
+            account_balance = safe_float(getattr(CONFIG.TRADE, "PAPER_BALANCE_USDT", 100.0), 100.0)
     except Exception:
         _log_qty_diagnostics(order, diag, "QTY_BALANCE_FETCH_FAIL")
+        send_telegram_message(f"{order['symbol']} QTY_BALANCE_FETCH_FAIL")
         return 0.0, "QTY_BALANCE_FETCH_FAIL"
 
     diag["account_balance"] = account_balance
