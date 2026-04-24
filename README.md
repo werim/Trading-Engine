@@ -29,9 +29,9 @@ Post-news fiyat davranış analizi için:
 
 ```bash
 python3 news_backtest.py \
-  --symbols BTCUSDT,ETHUSDT \
+  --symbols BTCUSDT,ETHUSDT,SOLUSDT,AVAXUSDT \
   --start 2025-01-01T00:00:00Z \
-  --end 2025-03-01T00:00:00Z \
+  --end 2026-03-01T00:00:00Z \
   --events-csv data/news_backtest/events_raw.csv \
   --output-dir data/news_backtest
 ```

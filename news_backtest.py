@@ -5,10 +5,12 @@ import csv
 import json
 import math
 import os
+import calendar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import feedparser
 import requests
 
 
@@ -19,6 +21,14 @@ HORIZONS = {
     "4h": 4 * 60 * 60,
     "24h": 24 * 60 * 60,
 }
+
+RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
+    "https://cointelegraph.com/rss",
+    "https://cryptopotato.com/feed/",
+    "https://cryptoslate.com/feed/",
+    "https://cryptonews.com/news/feed/",
+]
 
 
 @dataclass
@@ -134,6 +144,70 @@ class EventCollector:
                 )
         return events
 
+    def from_rss(self, symbols: List[str], since_ms: int) -> List[Event]:
+        symbol_set = set(symbols)
+        events: List[Event] = []
+        seen: set[tuple[str, int, str]] = set()
+
+        for url in RSS_FEEDS:
+            try:
+                resp = self.session.get(url, timeout=(5, 20), headers={"User-Agent": "Mozilla/5.0"})
+                resp.raise_for_status()
+                feed = feedparser.parse(resp.content)
+            except Exception:
+                continue
+
+            entries = getattr(feed, "entries", []) or []
+            for entry in entries[:200]:
+                title = str(getattr(entry, "title", "") or "")
+                if not title:
+                    continue
+
+                published_parsed = (
+                    getattr(entry, "published_parsed", None)
+                    or getattr(entry, "updated_parsed", None)
+                    or getattr(entry, "created_parsed", None)
+                )
+                timestamp_ms = _struct_time_to_utc_ms(published_parsed)
+                if timestamp_ms <= 0:
+                    timestamp_ms = _parse_time_ms(
+                        str(getattr(entry, "published", "") or getattr(entry, "updated", "") or "")
+                    )
+                if timestamp_ms <= 0 or timestamp_ms < since_ms:
+                    continue
+
+                title_lc = title.lower()
+                symbol = ""
+                if "bitcoin" in title_lc or "btc" in title_lc:
+                    symbol = "BTCUSDT"
+                elif "ethereum" in title_lc or "eth" in title_lc:
+                    symbol = "ETHUSDT"
+                if not symbol or symbol not in symbol_set:
+                    continue
+
+                mention_volume = 1.0
+                if "etf" in title_lc or "sec" in title_lc:
+                    mention_volume += 3.0
+
+                key = (symbol, timestamp_ms, title)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                events.append(
+                    Event(
+                        symbol=symbol,
+                        event_time_ms=timestamp_ms,
+                        source="rss",
+                        text=title,
+                        sentiment_score=0.0,
+                        mention_volume=mention_volume,
+                        event_type="news",
+                    )
+                )
+
+        return events
+
 
 def _parse_time_ms(raw: str) -> int:
     value = raw.strip()
@@ -150,6 +224,15 @@ def _parse_time_ms(raw: str) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
+
+
+def _struct_time_to_utc_ms(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(calendar.timegm(value) * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _infer_sentiment_from_votes(row: Dict[str, Any]) -> float:
@@ -359,6 +442,9 @@ def main() -> None:
     events = collector.from_csv(args.events_csv)
     if args.with_cryptopanic:
         events.extend(collector.from_cryptopanic(symbols, start_ms))
+    rss_events = collector.from_rss(symbols, start_ms)
+    events.extend(rss_events)
+    print(f"RSS events: {len(rss_events)}")
 
     events = [e for e in events if start_ms <= e.event_time_ms <= end_ms and e.symbol in symbols]
     if not events:

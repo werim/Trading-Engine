@@ -590,6 +590,7 @@ def _is_ranging_context(candidate: Dict[str, Any]) -> bool:
 
 def passes_order_filters(candidate: Dict[str, Any]) -> Tuple[bool, str]:
     hard_reasons: List[str] = []
+    soft_flags: List[str] = []
     score = safe_float(candidate.get("score"))
 
     rr = safe_float(candidate["rr"])
@@ -620,7 +621,7 @@ def passes_order_filters(candidate: Dict[str, Any]) -> Tuple[bool, str]:
     if stop_pct < 0.08:
         hard_reasons.append("STOP_TOO_TIGHT")
     if stop_pct > 3.8:
-        hard_reasons.append("STOP_TOO_WIDE")
+        soft_flags.append("STOP_TOO_WIDE")
     if tp_pct < 0.12:
         hard_reasons.append("TP_TOO_CLOSE")
 
@@ -643,6 +644,13 @@ def passes_order_filters(candidate: Dict[str, Any]) -> Tuple[bool, str]:
         score -= 1
     if int(candidate.get("adaptive_sample_size", 0)) > 0 and safe_float(candidate.get("adaptive_expectancy")) < CONFIG.FILTER.MIN_ADAPTIVE_EXPECTANCY:
         score -= 1
+    if "STOP_TOO_WIDE" in soft_flags:
+        score -= 1
+
+    if soft_flags:
+        existing_flags = str(candidate.get("soft_filter_flags", "")).strip()
+        merged_flags = [x for x in existing_flags.split("|") if x] + soft_flags
+        candidate["soft_filter_flags"] = "|".join(dict.fromkeys(merged_flags))
 
     candidate["score"] = max(0, int(round(score)))
     if candidate["score"] < CONFIG.FILTER.MIN_SCORE:
@@ -1041,7 +1049,23 @@ def near_trigger(order: Dict[str, Any], live_price: float, ratio: float = 0.0015
 
 def update_virtual_order_market_state(order: Dict[str, Any], market_ctx: Dict[str, Any]) -> Dict[str, Any]:
     live_price = safe_float(market_ctx["last_price"])
+    live_high = max(
+        live_price,
+        safe_float(market_ctx.get("last_1m_high", 0.0)),
+        safe_float(market_ctx.get("candle_high", 0.0)),
+        safe_float(market_ctx.get("high", 0.0)),
+    )
+    low_candidates = [
+        live_price,
+        safe_float(market_ctx.get("last_1m_low", 0.0)),
+        safe_float(market_ctx.get("candle_low", 0.0)),
+        safe_float(market_ctx.get("low", 0.0)),
+    ]
+    low_candidates = [v for v in low_candidates if v > 0]
+    live_low = min(low_candidates) if low_candidates else live_price
     order["live_price"] = live_price
+    order["live_high"] = live_high
+    order["live_low"] = live_low
     status = get_order_status(order)
     order_type = normalize_status(order.get("order_type"))
     side = normalize_status(order.get("side"))
@@ -1059,6 +1083,20 @@ def update_virtual_order_market_state(order: Dict[str, Any], market_ctx: Dict[st
             order["watch_reason"] = "BREAKOUT_CONFIRM_SHORT"
 
     if zone_is_touched(order, live_price):
+        if int(order.get("zone_touched", 0)) != 1:
+            log.info(
+                "ORDER_ZONE_TOUCHED symbol=%s order_id=%s side=%s setup=%s trigger=%s zone=[%s,%s] live=%s high=%s low=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                side,
+                order.get("setup_type"),
+                trigger,
+                order.get("entry_zone_low"),
+                order.get("entry_zone_high"),
+                live_price,
+                live_high,
+                live_low,
+            )
         order["zone_touched"] = 1
         if get_order_status(order) in {"WATCHING", "PLANNED"}:
             order["status"] = "READY"
@@ -1217,6 +1255,8 @@ def _preempt_weaker_orders_if_needed(order: Dict[str, Any], open_orders: List[Di
 def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
     trigger = safe_float(order.get("entry_trigger"))
     live_price = safe_float(order.get("live_price"))
+    live_high = max(live_price, safe_float(order.get("live_high", 0.0)))
+    live_low = min([v for v in [live_price, safe_float(order.get("live_low", 0.0))] if v > 0] or [live_price])
     side = str(order.get("side", "")).upper()
     is_breakout = _is_breakout_order(order)
 
@@ -1228,21 +1268,56 @@ def _paper_fill_or_queue(order: Dict[str, Any]) -> Dict[str, Any]:
     should_fill = normalize_status(order.get("order_type")) == "MARKET"
     if not should_fill:
         if is_breakout:
-            if side == "LONG" and live_price >= trigger:
+            if side == "LONG" and live_high >= trigger:
                 should_fill = True
-            elif side == "SHORT" and live_price <= trigger:
+            elif side == "SHORT" and live_low <= trigger:
                 should_fill = True
         else:
-            if side == "LONG" and live_price <= trigger:
+            if side == "LONG" and live_low <= trigger:
                 should_fill = True
-            elif side == "SHORT" and live_price >= trigger:
+            elif side == "SHORT" and live_high >= trigger:
                 should_fill = True
+
+    log.info(
+        "ORDER_PAPER_FILL_CHECK symbol=%s order_id=%s status=%s side=%s type=%s breakout=%s trigger=%s live=%s high=%s low=%s eligible=%s",
+        order.get("symbol"),
+        order.get("order_id"),
+        order.get("status"),
+        side,
+        order.get("order_type"),
+        int(is_breakout),
+        trigger,
+        live_price,
+        live_high,
+        live_low,
+        int(should_fill),
+    )
 
     if should_fill:
         order["status"] = "FILLED"
         order["exchange_status"] = "PAPER_FILLED"
         order["executed_qty"] = safe_float(order.get("submitted_qty"))
         order["avg_fill_price"] = live_price if normalize_status(order.get("order_type")) == "MARKET" else trigger
+        log.info(
+            "ORDER_PAPER_FILLED symbol=%s order_id=%s side=%s trigger=%s fill=%s qty=%s",
+            order.get("symbol"),
+            order.get("order_id"),
+            side,
+            trigger,
+            order.get("avg_fill_price"),
+            order.get("executed_qty"),
+        )
+    else:
+        log.info(
+            "ORDER_PAPER_QUEUED symbol=%s order_id=%s side=%s trigger=%s live=%s high=%s low=%s",
+            order.get("symbol"),
+            order.get("order_id"),
+            side,
+            trigger,
+            live_price,
+            live_high,
+            live_low,
+        )
 
     return stamp_updated(order)
 
@@ -1257,6 +1332,8 @@ def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
 
     trigger = safe_float(order.get("entry_trigger"))
     live_price = safe_float(order.get("live_price"))
+    live_high = max(live_price, safe_float(order.get("live_high", 0.0)))
+    live_low = min([v for v in [live_price, safe_float(order.get("live_low", 0.0))] if v > 0] or [live_price])
     side = normalize_status(order.get("side"))
     order_type = normalize_status(order.get("order_type"))
     is_breakout = _is_breakout_order(order)
@@ -1264,9 +1341,23 @@ def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
     should_fill = order_type == "MARKET"
     if not should_fill:
         if is_breakout:
-            should_fill = (side == "LONG" and live_price >= trigger) or (side == "SHORT" and live_price <= trigger)
+            should_fill = (side == "LONG" and live_high >= trigger) or (side == "SHORT" and live_low <= trigger)
         else:
-            should_fill = (side == "LONG" and live_price <= trigger) or (side == "SHORT" and live_price >= trigger)
+            should_fill = (side == "LONG" and live_low <= trigger) or (side == "SHORT" and live_high >= trigger)
+
+    log.info(
+        "ORDER_PAPER_RECONCILE_CHECK symbol=%s order_id=%s side=%s type=%s breakout=%s trigger=%s live=%s high=%s low=%s eligible=%s",
+        order.get("symbol"),
+        order.get("order_id"),
+        side,
+        order_type,
+        int(is_breakout),
+        trigger,
+        live_price,
+        live_high,
+        live_low,
+        int(should_fill),
+    )
 
     if not should_fill:
         return stamp_updated(order)
@@ -1275,6 +1366,15 @@ def _paper_reconcile_pending_order(order: Dict[str, Any]) -> Dict[str, Any]:
     order["exchange_status"] = "PAPER_FILLED"
     order["executed_qty"] = safe_float(order.get("submitted_qty"))
     order["avg_fill_price"] = live_price if order_type == "MARKET" else trigger
+    log.info(
+        "ORDER_PAPER_RECONCILE_FILLED symbol=%s order_id=%s side=%s trigger=%s fill=%s qty=%s",
+        order.get("symbol"),
+        order.get("order_id"),
+        side,
+        trigger,
+        order.get("avg_fill_price"),
+        order.get("executed_qty"),
+    )
     return stamp_updated(order)
 
 
@@ -1296,6 +1396,9 @@ def _prepare_order_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> Tu
     expectancy = safe_float(order.get("adaptive_expectancy"))
     expectancy_mult = 1.0 + min(0.35, max(-0.40, expectancy * 0.25))
     size_mult *= max(0.25, score_mult * expectancy_mult)
+    soft_flags = str(order.get("soft_filter_flags", ""))
+    if "STOP_TOO_WIDE" in soft_flags:
+        size_mult *= 0.75
     if size_mult > 0:
         qty *= size_mult
     if qty <= 0:
@@ -1354,6 +1457,20 @@ def submit_real_order_from_virtual(order: Dict[str, Any]) -> Dict[str, Any]:
 
     order["submitted_qty"] = qty
     order = _ensure_client_order_id(order)
+    log.info(
+        "ORDER_SUBMIT_TRANSITION symbol=%s order_id=%s side=%s type=%s status=%s zone_touched=%s trigger=%s live=%s high=%s low=%s adaptive_reason=%s",
+        order.get("symbol"),
+        order.get("order_id"),
+        order.get("side"),
+        order.get("order_type"),
+        order.get("status"),
+        order.get("zone_touched", 0),
+        order.get("entry_trigger"),
+        order.get("live_price"),
+        order.get("live_high"),
+        order.get("live_low"),
+        order.get("adaptive_reason", ""),
+    )
 
     if CONFIG.ENGINE.EXECUTION_MODE == "PAPER":
         return _paper_fill_or_queue(order)
@@ -1578,6 +1695,16 @@ def process_existing_order(
                 active_after_preempt = [o for o in open_orders if not is_final_order_status(o.get("status"))]
                 ok, reason = risk.can_open_new_order(order, active_after_preempt, open_positions)
         if not ok:
+            log.info(
+                "ORDER_READY_BLOCKED symbol=%s order_id=%s reason=%s side=%s setup=%s adaptive_reason=%s zone_touched=%s",
+                order.get("symbol"),
+                order.get("order_id"),
+                reason,
+                order.get("side"),
+                order.get("setup_type"),
+                order.get("adaptive_reason", ""),
+                order.get("zone_touched", 0),
+            )
             order["status"] = "CANCELLED"
             order["exchange_status"] = reason
             order["close_reason"] = reason
