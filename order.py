@@ -1378,7 +1378,7 @@ def detect_breakout_context(order: Dict[str, Any], market_ctx: Dict[str, Any]) -
         "is_breakout": is_breakout,
         "breakout_direction": direction if direction in {"LONG", "SHORT"} else "",
         "price_distance_pct": price_distance_pct,
-        +        +        +  volume_multiplier,
+        "volume_multiplier":  volume_multiplier,
         "reason": reason,
     }
 
