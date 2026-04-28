@@ -12,6 +12,8 @@ from utils import (
 
 client = BinanceFuturesClient()
 
+ORDER_LOG_FILE = CONFIG.FILES.ORDER_LOG_FILE
+
 
 def ema(values: List[float], period: int) -> List[float]:
     if not values:
@@ -66,17 +68,60 @@ def get_tf_trend(symbol: str, interval: str) -> str:
     raw = client.get_klines(symbol, interval, CONFIG.TRADE.KLINE_LIMIT)
     candles = parse_klines(raw)
     closes = [c["close"] for c in candles]
-    if len(closes) < CONFIG.TRADE.EMA_SLOW:
+
+    slow = CONFIG.TRADE.EMA_SLOW
+    mid = CONFIG.TRADE.EMA_MID
+    fast = CONFIG.TRADE.EMA_FAST
+
+    if len(closes) < slow + 5:
         return "RANGE"
 
-    e20 = ema(closes, CONFIG.TRADE.EMA_FAST)[-1]
-    e50 = ema(closes, CONFIG.TRADE.EMA_MID)[-1]
-    e200 = ema(closes, CONFIG.TRADE.EMA_SLOW)[-1]
+    ema_fast_series = ema(closes, fast)
+    ema_mid_series = ema(closes, mid)
+    ema_slow_series = ema(closes, slow)
+
+    e20 = ema_fast_series[-1]
+    e50 = ema_mid_series[-1]
+    e200 = ema_slow_series[-1]
     last = closes[-1]
 
-    if last > e20 > e50 > e200:
+    prev_e20 = ema_fast_series[-2]
+    prev_e50 = ema_mid_series[-2]
+    prev_e200 = ema_slow_series[-2]
+
+    # slope checks
+    e20_up = e20 > prev_e20
+    e50_up = e50 > prev_e50
+    e200_up = e200 > prev_e200
+
+    e20_down = e20 < prev_e20
+    e50_down = e50 < prev_e50
+    e200_down = e200 < prev_e200
+
+    # small buffer to avoid noise
+    min_sep = last * 0.001  # 0.10%
+
+    long_aligned = (
+        last > e20 and
+        e20 > e50 and
+        e50 > e200 and
+        (e20 - e50) > min_sep * 0.5 and
+        (e50 - e200) > min_sep and
+        e20_up and e50_up and e200_up
+    )
+
+    short_aligned = (
+        last < e20 and
+        e20 < e50 and
+        e50 < e200 and
+        (e50 - e20) > min_sep * 0.5 and
+        (e200 - e50) > min_sep and
+        e20_down and e50_down and e200_down
+    )
+
+    if long_aligned:
         return "LONG"
-    if last < e20 < e50 < e200:
+    if short_aligned:
         return "SHORT"
     return "RANGE"
 
@@ -103,13 +148,13 @@ def regime_name(tD: str) -> str:
 
 
 def score_setup(
-    t1: str,
-    t4: str,
-    tD: str,
-    rr: float,
-    spread_pct: float,
-    funding_rate_pct: float,
-    setup_type: str,
+        t1: str,
+        t4: str,
+        tD: str,
+        rr: float,
+        spread_pct: float,
+        funding_rate_pct: float,
+        setup_type: str,
 ) -> int:
     score = 0
 
@@ -131,13 +176,13 @@ def score_setup(
 
 
 def filter_regime(
-    t1: str,
-    t4: str,
-    tD: str,
-    setup_type: str,
-    rr: float,
-    exp_net: float,
-    score: int,
+        t1: str,
+        t4: str,
+        tD: str,
+        setup_type: str,
+        rr: float,
+        exp_net: float,
+        score: int,
 ) -> Tuple[bool, str]:
     if not CONFIG.TRADE.ENABLE_REGIME_FILTER:
         return True, "REGIME_FILTER_DISABLED"
@@ -284,6 +329,8 @@ def get_setup(symbol: str, market_snapshot: Dict[str, Any]) -> Optional[Dict[str
             reason = "RANGE_BREAKOUT_SHORT"
 
     if not side:
+        log_message(f"NO_SETUP_REASON {symbol} t1={t1} t4={t4} tD={tD} last={last} ema20={ema20} ema50={ema50}",
+                    ORDER_LOG_FILE)
         return None
 
     rr = compute_rr(entry, sl, tp, side)

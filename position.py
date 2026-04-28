@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from decimal import Decimal, ROUND_DOWN
 
 from config import CONFIG
 from telegram_alert import (
@@ -53,6 +54,33 @@ def save_open_orders(rows: List[Dict[str, Any]]) -> None:
     write_csv(CONFIG.FILES.OPEN_ORDERS_CSV, rows, order_fieldnames())
 
 
+def save_closed_orders(rows: List[Dict[str, Any]]) -> None:
+    write_csv(CONFIG.FILES.CLOSED_ORDERS_CSV, rows, order_fieldnames())
+
+
+def move_nopen_orders(rows: List[Dict[str, Any]]) -> None:
+    open_rows = []
+    closed_rows = []
+
+    for row in rows:
+        status = row.get("status")
+
+        if status == "OPEN_ORDER":
+            open_rows.append(row)
+        else:
+            closed_rows.append(row)
+
+    # Save only OPEN_ORDER rows back to open_orders.csv
+    write_csv(CONFIG.FILES.OPEN_ORDERS_CSV, open_rows, order_fieldnames())
+
+    # Append non-open orders to closed_orders.csv
+    if closed_rows:
+        existing_closed = read_csv(CONFIG.FILES.CLOSED_ORDERS_CSV)
+        all_closed = existing_closed + closed_rows
+
+        write_csv(CONFIG.FILES.CLOSED_ORDERS_CSV, all_closed, order_fieldnames())
+
+
 def load_open_positions() -> List[Dict[str, Any]]:
     return read_csv(CONFIG.FILES.OPEN_POSITIONS_CSV)
 
@@ -98,28 +126,64 @@ def _close_reconcile_sleep_seconds() -> float:
 
 
 # =========================================================
+# PRECISION HELPERS
+# =========================================================
+
+def floor_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return float(value)
+
+    value_dec = Decimal(str(value))
+    step_dec = Decimal(str(step))
+    floored = (value_dec / step_dec).to_integral_value(rounding=ROUND_DOWN) * step_dec
+    return float(floored)
+
+
+def format_by_step(value: float, step: float) -> str:
+    if step <= 0:
+        return format(Decimal(str(value)), "f")
+
+    value_dec = Decimal(str(value))
+    step_dec = Decimal(str(step))
+    quantized = value_dec.quantize(step_dec, rounding=ROUND_DOWN)
+    return format(quantized, "f")
+
+
+def _normalize_qty(value: float, symbol_meta: Dict[str, Any]) -> float:
+    step = _qty_step_from_meta(symbol_meta)
+    min_qty = _min_qty_from_meta(symbol_meta)
+
+    qty = floor_to_step(value, step) if step > 0 else float(value)
+    if min_qty and qty < min_qty:
+        return 0.0
+    return qty
+
+
+def _normalize_price(value: float, symbol_meta: Dict[str, Any]) -> float:
+    tick = _price_tick_from_meta(symbol_meta)
+    return floor_to_step(value, tick) if tick > 0 else float(value)
+
+
+def _qty_to_exchange_str(value: float, symbol_meta: Dict[str, Any]) -> str:
+    step = _qty_step_from_meta(symbol_meta)
+    qty = _normalize_qty(value, symbol_meta)
+    return format_by_step(qty, step) if step > 0 else str(qty)
+
+
+def _price_to_exchange_str(value: float, symbol_meta: Dict[str, Any]) -> str:
+    tick = _price_tick_from_meta(symbol_meta)
+    price = _normalize_price(value, symbol_meta)
+    return format_by_step(price, tick) if tick > 0 else str(price)
+
+
+# =========================================================
 # COMMON HELPERS
 # =========================================================
 
 def calc_qty(symbol: str, entry: float, symbol_meta: Dict[str, Any]) -> float:
     notional = CONFIG.TRADE.USDT_PER_TRADE * CONFIG.TRADE.LEVERAGE
     raw_qty = notional / entry if entry > 0 else 0.0
-
-    qty_step = (
-            symbol_meta.get("qty_step")
-            or symbol_meta.get("stepSize")
-            or symbol_meta.get("step_size")
-            or 0.0
-    )
-    min_qty = (
-            symbol_meta.get("min_qty")
-            or symbol_meta.get("minQty")
-            or 0.0
-    )
-
-    qty = round_step(raw_qty, qty_step) if qty_step else raw_qty
-    if min_qty and qty < min_qty:
-        qty = min_qty
+    qty = _normalize_qty(raw_qty, symbol_meta)
     return qty
 
 
@@ -132,33 +196,49 @@ def close_side_to_binance(side: str) -> str:
 
 
 def _price_tick_from_meta(symbol_meta: Dict[str, Any]) -> float:
-    return safe_float(
+    direct = safe_float(
         symbol_meta.get("price_tick")
         or symbol_meta.get("tickSize")
         or symbol_meta.get("priceTick")
         or 0.0
     )
+    if direct > 0:
+        return direct
+
+    for f in symbol_meta.get("filters", []):
+        if f.get("filterType") == "PRICE_FILTER":
+            return safe_float(f.get("tickSize"))
+
+    return 0.0
 
 
-"""
 def _qty_step_from_meta(symbol_meta: Dict[str, Any]) -> float:
-    return safe_float(
+    direct = safe_float(
         symbol_meta.get("qty_step")
         or symbol_meta.get("stepSize")
         or symbol_meta.get("step_size")
         or 0.0
-    )"""
+    )
+    if direct > 0:
+        return direct
 
+    for f in symbol_meta.get("filters", []):
+        if f.get("filterType") == "LOT_SIZE":
+            return safe_float(f.get("stepSize"))
 
-def _qty_step_from_meta(symbol_meta):
-    for f in symbol_meta["filters"]:
-        if f["filterType"] == "LOT_SIZE":
-            return float(f["stepSize"])
-    return 0.001
+    return 0.0
 
 
 def _min_qty_from_meta(symbol_meta: Dict[str, Any]) -> float:
-    return safe_float(symbol_meta.get("min_qty") or symbol_meta.get("minQty") or 0.0)
+    direct = safe_float(symbol_meta.get("min_qty") or symbol_meta.get("minQty") or 0.0)
+    if direct > 0:
+        return direct
+
+    for f in symbol_meta.get("filters", []):
+        if f.get("filterType") == "LOT_SIZE":
+            return safe_float(f.get("minQty"))
+
+    return 0.0
 
 
 def _normalize_binance_status(v: Any) -> str:
@@ -456,29 +536,37 @@ def _dedupe_positions(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # =========================================================
 
 def arm_protection(
-        client: Any,
-        symbol: str,
-        side: str,
-        qty: float,
-        sl: float,
-        tp: float,
+    client: Any,
+    symbol: str,
+    side: str,
+    qty: float,
+    sl: float,
+    tp: float,
+    symbol_meta: Dict[str, Any],
 ) -> Dict[str, Any]:
     sl_side = close_side_to_binance(side)
     tp_side = close_side_to_binance(side)
 
+    qty_s = _qty_to_exchange_str(qty, symbol_meta)
+    sl_s = _price_to_exchange_str(sl, symbol_meta)
+    tp_s = _price_to_exchange_str(tp, symbol_meta)
+
+    if safe_float(qty_s) <= 0:
+        raise RuntimeError(f"PROTECTION_QTY_INVALID {symbol} qty={qty_s}")
+
     sl_order = client.place_stop_market(
         symbol=symbol,
         side=sl_side,
-        stop_price=sl,
+        stop_price=sl_s,
         reduce_only=True,
-        quantity=qty,
+        quantity=qty_s,
     )
     tp_order = client.place_take_profit_market(
         symbol=symbol,
         side=tp_side,
-        stop_price=tp,
+        stop_price=tp_s,
         reduce_only=True,
-        quantity=qty,
+        quantity=qty_s,
     )
 
     return {
@@ -535,22 +623,21 @@ def rearm_protection_for_position(pos: Dict[str, Any], symbol_meta: Dict[str, An
     if client is None:
         raise RuntimeError("REAL mode active but Binance client could not be created")
 
-    current_qty = safe_float(pos.get("qty"))
+    current_qty = _normalize_qty(safe_float(pos.get("qty")), symbol_meta)
     if current_qty <= 0:
         pos["sl_order_id"] = ""
         pos["tp_order_id"] = ""
         pos["protection_armed"] = 0
         return
 
-    price_tick = _price_tick_from_meta(symbol_meta)
-
     protection = arm_protection(
         client=client,
         symbol=pos["symbol"],
         side=pos["side"],
         qty=current_qty,
-        sl=round_tick(safe_float(pos["sl"]), price_tick) if price_tick else safe_float(pos["sl"]),
-        tp=round_tick(safe_float(pos["tp"]), price_tick) if price_tick else safe_float(pos["tp"]),
+        sl=safe_float(pos["sl"]),
+        tp=safe_float(pos["tp"]),
+        symbol_meta=symbol_meta,
     )
 
     pos["sl_order_id"] = protection["sl_order_id"]
@@ -580,37 +667,32 @@ def _safe_rearm_after_change(pos: Dict[str, Any], symbol_meta: Dict[str, Any]) -
 # =========================================================
 
 def _flatten_partial_entry_if_any(
-        client: Any,
-        symbol: str,
-        side: str,
-        partial_qty: float,
-        symbol_meta: Dict[str, Any],
+    client: Any,
+    symbol: str,
+    side: str,
+    partial_qty: float,
+    symbol_meta: Dict[str, Any],
 ) -> None:
     if partial_qty <= 0:
         return
 
-    qty_step = _qty_step_from_meta(symbol_meta)
-    min_qty = _min_qty_from_meta(symbol_meta)
-
-    close_qty = round_step(partial_qty, qty_step) if qty_step else partial_qty
+    close_qty = _normalize_qty(partial_qty, symbol_meta)
     if close_qty <= 0:
-        return
-    if min_qty and close_qty < min_qty:
         return
 
     client.place_market_order(
         symbol=symbol,
         side=close_side_to_binance(side),
-        quantity=close_qty,
+        quantity=_qty_to_exchange_str(close_qty, symbol_meta),
         reduce_only=True,
     )
 
 
 def _wait_for_fill(
-        client: Any,
-        symbol: str,
-        order_id: str,
-        expected_qty: float,
+    client: Any,
+    symbol: str,
+    order_id: str,
+    expected_qty: float,
 ) -> Tuple[bool, float, float, Dict[str, Any]]:
     """
     Dönüş:
@@ -643,7 +725,6 @@ def _wait_for_fill(
 
         time.sleep(poll)
 
-    # timeout
     exec_qty = _response_executed_qty(last_status)
     avg_price = _response_avg_price(last_status)
     if exec_qty >= expected_qty > 0:
@@ -653,8 +734,8 @@ def _wait_for_fill(
 
 
 def _submit_entry_and_confirm(
-        order: Dict[str, Any],
-        symbol_meta: Dict[str, Any],
+    order: Dict[str, Any],
+    symbol_meta: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """
     REAL modda gerçek fill teyidi alınmadan pozisyon açılmaz.
@@ -674,24 +755,31 @@ def _submit_entry_and_confirm(
     symbol = order["symbol"]
     side = order["side"]
     desired_entry = safe_float(order["entry_trigger"])
+
     qty = calc_qty(symbol, desired_entry, symbol_meta)
-
     if qty <= 0:
-        raise RuntimeError(f"Calculated qty <= 0 for {symbol}")
+        raise RuntimeError(f"CALCULATED_QTY_INVALID {symbol} qty={qty}")
 
-    price_tick = _price_tick_from_meta(symbol_meta)
-    use_limit_entry = bool(getattr(CONFIG.TRADE, "USE_LIMIT_ENTRY", False))
+    entry_price = _normalize_price(desired_entry, symbol_meta)
+
+    qty_s = _qty_to_exchange_str(qty, symbol_meta)
+    price_s = _price_to_exchange_str(entry_price, symbol_meta)
+
+    log_message(
+        f"ENTRY_PRECISION_PREP {symbol} side={side} qty={qty_s} price={price_s} "
+        f"qty_step={_qty_step_from_meta(symbol_meta)} tick={_price_tick_from_meta(symbol_meta)}",
+        CONFIG.FILES.POSITION_LOG_FILE,
+    )
 
     client.set_leverage(symbol, CONFIG.TRADE.LEVERAGE)
+    use_limit_entry = bool(getattr(CONFIG.TRADE, "USE_LIMIT_ENTRY", False))
 
     if use_limit_entry:
-        price = round_tick(desired_entry, price_tick) if price_tick else desired_entry
-
         limit_resp = client.place_limit_order(
             symbol=symbol,
             side=side_to_binance(side),
-            quantity=qty,
-            price=price,
+            quantity=qty_s,
+            price=price_s,
             reduce_only=False,
         )
 
@@ -703,19 +791,18 @@ def _submit_entry_and_confirm(
             client=client,
             symbol=symbol,
             order_id=entry_order_id,
-            expected_qty=qty,
+            expected_qty=safe_float(qty_s),
         )
 
         if filled:
-            fill_price = avg_price if avg_price > 0 else price
-            filled_qty = executed_qty if executed_qty > 0 else qty
+            fill_price = avg_price if avg_price > 0 else safe_float(price_s)
+            filled_qty = executed_qty if executed_qty > 0 else safe_float(qty_s)
             return {
                 "entry_price": round(fill_price, 8),
                 "filled_qty": round(filled_qty, 8),
                 "entry_order_id": entry_order_id,
             }
 
-        # timeout / partial / failed
         try:
             client.cancel_order(symbol=symbol, order_id=int(entry_order_id))
         except Exception as e:
@@ -734,11 +821,10 @@ def _submit_entry_and_confirm(
 
         return None
 
-    # MARKET ENTRY
     market_resp = client.place_market_order(
         symbol=symbol,
         side=side_to_binance(side),
-        quantity=qty,
+        quantity=qty_s,
         reduce_only=False,
     )
 
@@ -746,7 +832,6 @@ def _submit_entry_and_confirm(
     avg_price = _response_avg_price(market_resp)
     executed_qty = _response_executed_qty(market_resp)
 
-    # Mümkünse order query ile teyit
     if entry_order_id:
         status = _get_order_status(client, symbol, entry_order_id)
         if isinstance(status, dict):
@@ -781,22 +866,19 @@ def _submit_entry_and_confirm(
 # =========================================================
 
 def open_position_from_order(
-        order: Dict[str, Any],
-        live_price: float,
-        symbol_meta: Dict[str, Any],
+    order: Dict[str, Any],
+    live_price: float,
+    symbol_meta: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     protection = {"sl_order_id": "", "tp_order_id": ""}
-    price_tick = _price_tick_from_meta(symbol_meta)
 
     if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
         entry_fill = _submit_entry_and_confirm(order, symbol_meta)
+        if entry_fill is None:
+            return None
 
-        price_tick = _price_tick_from_meta(symbol_meta)
-        qty_step = _qty_step_from_meta(symbol_meta)
-        entry = safe_float(entry_fill["entry_price"])
-        entry = round_tick(entry, price_tick)
-        qty = safe_float(entry_fill["filled_qty"])
-        qty = round_step_size(qty, qty_step)
+        entry = _normalize_price(safe_float(entry_fill["entry_price"]), symbol_meta)
+        qty = _normalize_qty(safe_float(entry_fill["filled_qty"]), symbol_meta)
 
         if qty <= 0:
             raise RuntimeError(f"ENTRY_FILLED_QTY_INVALID {order['symbol']} qty={qty}")
@@ -806,8 +888,9 @@ def open_position_from_order(
             symbol=order["symbol"],
             side=order["side"],
             qty=qty,
-            sl=round_tick(safe_float(order["sl"]), price_tick) if price_tick else safe_float(order["sl"]),
-            tp=round_tick(safe_float(order["tp"]), price_tick) if price_tick else safe_float(order["tp"]),
+            sl=safe_float(order["sl"]),
+            tp=safe_float(order["tp"]),
+            symbol_meta=symbol_meta,
         )
 
     else:
@@ -856,10 +939,10 @@ def open_position_from_order(
 
 
 def build_closed_row_from_order(
-        order: Dict[str, Any],
-        live_price: float,
-        symbol_meta: Dict[str, Any],
-        close_reason: str,
+    order: Dict[str, Any],
+    live_price: float,
+    symbol_meta: Dict[str, Any],
+    close_reason: str,
 ) -> Dict[str, Any]:
     """
     Entry görüldü ama sistem loop anında pozisyona taşıyamadan TP/SL tarafına gitmişse,
@@ -873,9 +956,9 @@ def build_closed_row_from_order(
 
     gross_pct = pct_change(entry, live_price, side)
     fees_pct = (
-            CONFIG.TRADE.MAKER_FEE_PCT
-            + CONFIG.TRADE.TAKER_FEE_PCT
-            + CONFIG.TRADE.ROUND_TRIP_SLIPPAGE_PCT
+        CONFIG.TRADE.MAKER_FEE_PCT
+        + CONFIG.TRADE.TAKER_FEE_PCT
+        + CONFIG.TRADE.ROUND_TRIP_SLIPPAGE_PCT
     )
     net_pct = gross_pct - fees_pct
     notional = entry * qty
@@ -921,9 +1004,9 @@ def build_closed_row_from_order(
 
 
 def _build_closed_row_from_position(
-        pos: Dict[str, Any],
-        live_price: float,
-        close_reason: str,
+    pos: Dict[str, Any],
+    live_price: float,
+    close_reason: str,
 ) -> Dict[str, Any]:
     closed_row = dict(pos)
     closed_row["status"] = "CLOSED"
@@ -1090,7 +1173,6 @@ def process_orders_into_positions() -> None:
 
             pos = open_position_from_order(order, live_price, symbol_meta)
             if pos is None:
-                # REAL limit entry dolmadıysa order açık kalsın, sonraki loop tekrar baksın
                 continue
 
             positions.append(pos)
@@ -1108,9 +1190,16 @@ def process_orders_into_positions() -> None:
 
         except Exception as e:
             err = str(e)
-            if "Precision is over" in str(err):
-                log_message("PRECISION_ERROR - skipping order", ...)
-                return None
+
+            if "Precision is over the maximum defined for this asset" in err:
+                order["status"] = "PRECISION_FAILED"
+                order["updated_at"] = utc_now_str()
+                log_message(
+                    f"PRECISION_ERROR symbol={order.get('symbol')} order_id={order.get('order_id')} error={err}",
+                    CONFIG.FILES.POSITION_LOG_FILE,
+                )
+                continue
+
             log_message(
                 f"ORDER_TO_POSITION_FAIL {order.get('symbol')} "
                 f"mode={CONFIG.ENGINE.EXECUTION_MODE} error={err}",
@@ -1146,14 +1235,13 @@ def execute_partial_close(pos: Dict[str, Any], close_ratio: float, symbol_meta: 
     close_ratio = max(0.0, min(close_ratio, 1.0))
     raw_close_qty = current_qty * close_ratio
 
-    qty_step = _qty_step_from_meta(symbol_meta)
-    min_qty = _min_qty_from_meta(symbol_meta)
-
-    close_qty = round_step(raw_close_qty, qty_step) if qty_step else raw_close_qty
+    close_qty = _normalize_qty(raw_close_qty, symbol_meta)
     if close_qty <= 0:
         return 0.0
 
-    remaining_qty = round_step(current_qty - close_qty, qty_step) if qty_step else (current_qty - close_qty)
+    remaining_qty = _normalize_qty(current_qty - close_qty, symbol_meta)
+    min_qty = _min_qty_from_meta(symbol_meta)
+
     if min_qty and remaining_qty < min_qty:
         return 0.0
 
@@ -1169,7 +1257,7 @@ def execute_partial_close(pos: Dict[str, Any], close_ratio: float, symbol_meta: 
         client.place_market_order(
             symbol=pos["symbol"],
             side=close_side_to_binance(pos["side"]),
-            quantity=close_qty,
+            quantity=_qty_to_exchange_str(close_qty, symbol_meta),
             reduce_only=True,
         )
 
@@ -1220,7 +1308,6 @@ def update_positions() -> None:
             tp = safe_float(pos["tp"])
             initial_risk = safe_float(pos.get("initial_risk"))
 
-            # REAL modda önce exchange qty ile senkron olmaya çalış
             if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
                 client = get_binance_client()
                 if client is None:
@@ -1261,9 +1348,9 @@ def update_positions() -> None:
 
             gross_pct = pct_change(entry, live_price, side)
             fees_pct = (
-                    CONFIG.TRADE.MAKER_FEE_PCT
-                    + CONFIG.TRADE.TAKER_FEE_PCT
-                    + CONFIG.TRADE.ROUND_TRIP_SLIPPAGE_PCT
+                CONFIG.TRADE.MAKER_FEE_PCT
+                + CONFIG.TRADE.TAKER_FEE_PCT
+                + CONFIG.TRADE.ROUND_TRIP_SLIPPAGE_PCT
             )
             net_pct = gross_pct - fees_pct
             notional = entry * qty
@@ -1289,7 +1376,6 @@ def update_positions() -> None:
             else:
                 progress_r = 0.0
 
-            # 1) BREAK EVEN
             if CONFIG.TRADE.ENABLE_TRAILING and not int(float(pos.get("break_even_armed", 0))):
                 if progress_r >= CONFIG.TRADE.BREAK_EVEN_TRIGGER_R:
                     old_sl = safe_float(pos["sl"])
@@ -1308,13 +1394,11 @@ def update_positions() -> None:
                             try:
                                 _safe_rearm_after_change(pos, symbol_meta)
                             except Exception:
-                                # break-even state'i loglansın ama pozisyon düşmesin
                                 pos["sl"] = round(old_sl, 8)
                                 pos["break_even_armed"] = 0
                                 updated_positions.append(pos)
                                 continue
 
-            # 2) PARTIAL TP
             partial_taken = int(float(pos.get("partial_taken", 0)))
             if partial_taken == 0 and CONFIG.TRADE.PARTIAL_TP_AT_R < 99:
                 if progress_r >= CONFIG.TRADE.PARTIAL_TP_AT_R:
@@ -1344,7 +1428,6 @@ def update_positions() -> None:
                                     updated_positions.append(pos)
                                     continue
 
-            # Partial sonrası qty sıfırlandıysa kapat
             if safe_float(pos.get("qty")) <= 0:
                 close_reason = "PARTIAL_CLOSE_TO_ZERO"
                 closed_row = _build_closed_row_from_position(pos, live_price, close_reason)
@@ -1358,7 +1441,6 @@ def update_positions() -> None:
                 alert_position_closed(pos, close_reason)
                 continue
 
-            # 3) TRAILING
             if CONFIG.TRADE.ENABLE_TRAILING and progress_r >= CONFIG.TRADE.TRAIL_AFTER_R:
                 old_sl = safe_float(pos["sl"])
 
@@ -1388,11 +1470,11 @@ def update_positions() -> None:
                                 updated_positions.append(pos)
                                 continue
 
-            # 4) CLOSE CHECK
             if CONFIG.ENGINE.EXECUTION_MODE == "REAL":
                 client = get_binance_client()
                 if client is None:
                     raise RuntimeError("REAL mode active but Binance client could not be created")
+
                 exchange_qty = _get_exchange_position_qty(client, pos["symbol"])
                 if exchange_qty is not None and exchange_qty <= 0:
                     price_reason = _infer_close_reason_from_price(side, live_price, safe_float(pos["sl"]), tp)
@@ -1409,8 +1491,6 @@ def update_positions() -> None:
                     alert_position_closed(pos, close_reason)
                     continue
 
-                # qty hala açıksa fiyat değdi diye kapatma yapma
-                # sadece protection pending logu bırak
                 if side == "LONG":
                     touched_sl_tp = live_price <= safe_float(pos["sl"]) or live_price >= tp
                 else:
@@ -1426,7 +1506,6 @@ def update_positions() -> None:
                 updated_positions.append(pos)
                 continue
 
-            # PAPER close logic
             close_reason: Optional[str] = None
             if side == "LONG":
                 if live_price <= safe_float(pos["sl"]):

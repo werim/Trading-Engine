@@ -48,3 +48,7 @@ echo
 echo "--- tail: position.log ---"
 tail -n 10 "$LOG_DIR/position.log" 2>/dev/null || true
 echo "==========================================="
+
+# Ekstra: çalışan python süreçleri
+echo "🐍 Active Python Processes:"
+ps aux | grep python | grep -v grep || echo "No active python processes"

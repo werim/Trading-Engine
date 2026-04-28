@@ -60,6 +60,8 @@ run_cycle_loop() {
     echo "🧠 order.py $(date)" | tee -a logs/order.supervisor.log
     python3 order.py >> logs/order.log 2>&1
     echo $! > "$ORDER_PID_FILE" 2>/dev/null || true
+    python3 hybrid.py >> logs/order.log 2>&1
+    echo $! > "$HYBRID_PID_FILE" 2>/dev/null || true
   done
 }
 

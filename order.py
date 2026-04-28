@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from binance_real import BinanceFuturesClient
@@ -65,6 +66,24 @@ def _get_max_open_orders() -> int:
     return int(getattr(trade_cfg, "MAX_OPEN_ORDERS", fallback))
 
 
+def _cfg_minutes(name: str, default: float) -> float:
+    """
+    Cooldown değerini öncelikle TRADE, yoksa FILES üzerinden oku.
+    Geçmiş sürümlerde bu alanlar FILES altında tutulduğu için
+    geriye dönük uyumluluk korunur.
+    """
+    trade_cfg = getattr(CONFIG, "TRADE", None)
+    files_cfg = getattr(CONFIG, "FILES", None)
+
+    if trade_cfg and hasattr(trade_cfg, name):
+        return float(getattr(trade_cfg, name))
+
+    if files_cfg and hasattr(files_cfg, name):
+        return float(getattr(files_cfg, name))
+
+    return float(default)
+
+
 def _make_expires_at() -> str:
     expiry_hours = _get_order_expiry_hours()
     dt = _utc_now_dt() + timedelta(hours=expiry_hours)
@@ -112,11 +131,108 @@ def _response_avg_price(resp: Any) -> float:
 def _response_executed_qty(resp: Any) -> float:
     if not isinstance(resp, dict):
         return 0.0
-    for key in ("executedQty", "executed_qty", "cumQty", "cum_qty"):
+    for key in ("executedQty", "executed_qty", "cumQty", "cum_qty", "origQty", "quantity", "qty"):
         value = safe_float(resp.get(key))
         if value > 0:
             return value
     return 0.0
+
+
+# =========================================================
+# PRECISION HELPERS
+# =========================================================
+
+def floor_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return float(value)
+
+    value_dec = Decimal(str(value))
+    step_dec = Decimal(str(step))
+    floored = (value_dec / step_dec).to_integral_value(rounding=ROUND_DOWN) * step_dec
+    return float(floored)
+
+
+def format_by_step(value: float, step: float) -> str:
+    if step <= 0:
+        return format(Decimal(str(value)), "f")
+
+    value_dec = Decimal(str(value))
+    step_dec = Decimal(str(step))
+    quantized = value_dec.quantize(step_dec, rounding=ROUND_DOWN)
+    return format(quantized, "f")
+
+
+def _price_tick_from_meta(symbol_meta: Dict[str, Any]) -> float:
+    direct = safe_float(
+        symbol_meta.get("price_tick")
+        or symbol_meta.get("tickSize")
+        or symbol_meta.get("priceTick")
+        or 0.0
+    )
+    if direct > 0:
+        return direct
+
+    for f in symbol_meta.get("filters", []):
+        if f.get("filterType") == "PRICE_FILTER":
+            return safe_float(f.get("tickSize"))
+
+    return 0.0
+
+
+def _qty_step_from_meta(symbol_meta: Dict[str, Any]) -> float:
+    direct = safe_float(
+        symbol_meta.get("qty_step")
+        or symbol_meta.get("stepSize")
+        or symbol_meta.get("step_size")
+        or 0.0
+    )
+    if direct > 0:
+        return direct
+
+    for f in symbol_meta.get("filters", []):
+        if f.get("filterType") == "LOT_SIZE":
+            return safe_float(f.get("stepSize"))
+
+    return 0.0
+
+
+def _min_qty_from_meta(symbol_meta: Dict[str, Any]) -> float:
+    direct = safe_float(symbol_meta.get("min_qty") or symbol_meta.get("minQty") or 0.0)
+    if direct > 0:
+        return direct
+
+    for f in symbol_meta.get("filters", []):
+        if f.get("filterType") == "LOT_SIZE":
+            return safe_float(f.get("minQty"))
+
+    return 0.0
+
+
+def _normalize_price(value: float, symbol_meta: Dict[str, Any]) -> float:
+    tick = _price_tick_from_meta(symbol_meta)
+    return floor_to_step(value, tick) if tick > 0 else float(value)
+
+
+def _normalize_qty(value: float, symbol_meta: Dict[str, Any]) -> float:
+    step = _qty_step_from_meta(symbol_meta)
+    min_qty = _min_qty_from_meta(symbol_meta)
+
+    qty = floor_to_step(value, step) if step > 0 else float(value)
+    if min_qty > 0 and qty < min_qty:
+        return 0.0
+    return qty
+
+
+def _price_to_exchange_str(value: float, symbol_meta: Dict[str, Any]) -> str:
+    tick = _price_tick_from_meta(symbol_meta)
+    normalized = _normalize_price(value, symbol_meta)
+    return format_by_step(normalized, tick) if tick > 0 else str(normalized)
+
+
+def _qty_to_exchange_str(value: float, symbol_meta: Dict[str, Any]) -> str:
+    step = _qty_step_from_meta(symbol_meta)
+    normalized = _normalize_qty(value, symbol_meta)
+    return format_by_step(normalized, step) if step > 0 else str(normalized)
 
 
 def _save_open_positions_rows(rows: List[Dict[str, Any]]) -> None:
@@ -315,6 +431,7 @@ def _recent_terminal_orders(all_orders: List[Dict[str, Any]]) -> List[Dict[str, 
         "REJECTED",
         "FAILED_SUBMIT",
         "FAILED_QTY",
+        "PRECISION_FAILED",
     }
     return [r for r in all_orders if str(r.get("status", "")).strip().upper() in terminal_statuses]
 
@@ -368,7 +485,7 @@ def _symbol_cancel_count_recent(
 
     for row in all_orders:
         status = str(row.get("status", "")).strip().upper()
-        if status not in {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED"}:
+        if status not in {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED", "FAILED_SUBMIT", "PRECISION_FAILED"}:
             continue
 
         if str(row.get("symbol", "")).strip().upper() != symbol:
@@ -382,9 +499,9 @@ def _symbol_cancel_count_recent(
 
 
 def _is_symbol_cancel_locked(symbol: str, all_orders: List[Dict[str, Any]]) -> bool:
-    window_minutes = float(getattr(CONFIG.TRADE, "ORDER_CANCEL_LOCK_WINDOW_MINUTES", 10))
-    lock_count = int(getattr(CONFIG.TRADE, "ORDER_CANCEL_LOCK_COUNT", 3))
-    lock_minutes = float(getattr(CONFIG.TRADE, "ORDER_CANCEL_LOCK_MINUTES", 15))
+    window_minutes = _cfg_minutes("ORDER_CANCEL_LOCK_WINDOW_MINUTES", 10)
+    lock_count = int(_cfg_minutes("ORDER_CANCEL_LOCK_COUNT", 3))
+    lock_minutes = _cfg_minutes("ORDER_CANCEL_LOCK_MINUTES", 15)
 
     recent_count = _symbol_cancel_count_recent(symbol, all_orders, window_minutes)
     if recent_count < lock_count:
@@ -398,7 +515,7 @@ def _is_symbol_cancel_locked(symbol: str, all_orders: List[Dict[str, Any]]) -> b
             continue
 
         status = str(row.get("status", "")).strip().upper()
-        if status not in {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED"}:
+        if status not in {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED", "FAILED_SUBMIT", "PRECISION_FAILED"}:
             continue
 
         ts = _row_last_ts(row)
@@ -419,12 +536,11 @@ def is_better_order(new_row: Dict[str, Any], old_row: Dict[str, Any]) -> bool:
 
     new_exp = safe_float(new_row.get("expected_net_pnl_pct", 0))
     old_exp = safe_float(old_row.get("expected_net_pnl_pct", 0))
-
+    """
     if new_exp > old_exp + 1e-9:
         return True
     if new_exp < old_exp - 1e-9:
         return False
-
     new_vol = safe_float(new_row.get("volume_24h_usdt", 0))
     old_vol = safe_float(old_row.get("volume_24h_usdt", 0))
 
@@ -432,8 +548,8 @@ def is_better_order(new_row: Dict[str, Any], old_row: Dict[str, Any]) -> bool:
         return True
     if new_vol < old_vol:
         return False
+    """
 
-    # Tam eşitlikte eski kalsın
     return False
 
 
@@ -496,8 +612,8 @@ def build_candidate_orders(
 ) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
 
-    symbol_cooldown = float(getattr(CONFIG.TRADE, "ORDER_RECREATE_COOLDOWN_MINUTES", 5))
-    setup_cooldown = float(getattr(CONFIG.TRADE, "ORDER_SAME_SETUP_COOLDOWN_MINUTES", 10))
+    symbol_cooldown = _cfg_minutes("ORDER_RECREATE_COOLDOWN_MINUTES", 5)
+    setup_cooldown = _cfg_minutes("ORDER_SAME_SETUP_COOLDOWN_MINUTES", 10)
 
     for symbol in symbols:
         try:
@@ -527,6 +643,10 @@ def build_candidate_orders(
                 continue
 
             if int(safe_float(setup.get("score", 0))) < CONFIG.TRADE.SCORE_MIN:
+                log_message(
+                    f"ORDER_SKIP_SCORE symbol={symbol} market={market}",
+                    ORDER_LOG_FILE,
+                )
                 continue
 
             if safe_float(setup.get("expected_net_pnl_pct", 0)) < CONFIG.TRADE.MIN_EXPECTED_NET_PNL_PCT:
@@ -832,20 +952,25 @@ def _arm_initial_protection(
     qty: float,
     sl: float,
     tp: float,
+    symbol_meta: Dict[str, Any],
 ) -> Tuple[str, str]:
+    qty_s = _qty_to_exchange_str(qty, symbol_meta)
+    sl_s = _price_to_exchange_str(sl, symbol_meta)
+    tp_s = _price_to_exchange_str(tp, symbol_meta)
+
     sl_resp = client.place_stop_market(
         symbol=symbol,
         side=_close_side_to_binance(side),
-        stop_price=sl,
+        stop_price=sl_s,
         reduce_only=True,
-        quantity=qty,
+        quantity=qty_s,
     )
     tp_resp = client.place_take_profit_market(
         symbol=symbol,
         side=_close_side_to_binance(side),
-        stop_price=tp,
+        stop_price=tp_s,
         reduce_only=True,
-        quantity=qty,
+        quantity=qty_s,
     )
     return _response_order_id(sl_resp), _response_order_id(tp_resp)
 
@@ -856,20 +981,14 @@ def _calc_submitted_qty(order: Dict[str, Any], symbol_meta: Dict[str, Any]) -> f
         return 0.0
 
     raw_qty = (CONFIG.TRADE.USDT_PER_TRADE * CONFIG.TRADE.LEVERAGE) / entry
-    qty_step = safe_float(symbol_meta.get("qty_step") or symbol_meta.get("stepSize"))
-    min_qty = safe_float(symbol_meta.get("min_qty") or symbol_meta.get("minQty"))
-
-    qty = round_step(raw_qty, qty_step) if qty_step > 0 else raw_qty
-    if min_qty > 0 and qty < min_qty:
-        qty = min_qty
-
-    return qty
+    return _normalize_qty(raw_qty, symbol_meta)
 
 
 def _resolve_filled_order(
     client: BinanceFuturesClient,
     order_row: Dict[str, Any],
     status_resp: Dict[str, Any],
+    symbol_meta: Dict[str, Any],
 ) -> Dict[str, Any]:
     positions = load_open_positions_rows()
     if any(
@@ -891,6 +1010,12 @@ def _resolve_filled_order(
     if executed_qty <= 0:
         raise RuntimeError(f"FILLED_WITH_ZERO_QTY symbol={order_row.get('symbol')}")
 
+    executed_qty = _normalize_qty(executed_qty, symbol_meta)
+    avg_price = _normalize_price(avg_price, symbol_meta)
+
+    if executed_qty <= 0:
+        raise RuntimeError(f"FILLED_WITH_INVALID_QTY symbol={order_row.get('symbol')}")
+
     sl_order_id, tp_order_id = _arm_initial_protection(
         client=client,
         symbol=order_row["symbol"],
@@ -898,6 +1023,7 @@ def _resolve_filled_order(
         qty=executed_qty,
         sl=safe_float(order_row["sl"]),
         tp=safe_float(order_row["tp"]),
+        symbol_meta=symbol_meta,
     )
 
     pos = _build_position_from_fill(
@@ -943,7 +1069,7 @@ def _run_real_mode_execution(
         if str(r.get("order_id", "")).strip()
     }
 
-    # 1) Sync existing submitted orders with Binance truth.
+    # 1) Existing submitted orders sync
     for row in all_rows:
         if row.get("status") != "OPEN_ORDER":
             continue
@@ -961,7 +1087,10 @@ def _run_real_mode_execution(
             row["updated_at"] = utc_now_str()
 
             if status == "FILLED":
-                row_by_order_id[row["order_id"]] = _resolve_filled_order(client, row, status_resp)
+                symbol_meta = get_symbol_meta(row["symbol"])
+                if not symbol_meta:
+                    raise RuntimeError(f"SYMBOL_META_MISSING_ON_FILLED_SYNC {row['symbol']}")
+                row_by_order_id[row["order_id"]] = _resolve_filled_order(client, row, status_resp, symbol_meta)
             elif status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
                 row["status"] = "CANCELLED" if status in {"CANCELED", "CANCELLED"} else status
                 row["cancel_reason"] = f"EXCHANGE_{status}"
@@ -971,7 +1100,7 @@ def _run_real_mode_execution(
                 ORDER_LOG_FILE,
             )
 
-    # 2) Submit only new local OPEN_ORDER rows that are zone_touched.
+    # 2) Submit only new local OPEN_ORDER rows that are zone_touched
     for candidate in selected_new_orders:
         local_order_id = str(candidate.get("order_id", "")).strip()
         row = row_by_order_id.get(local_order_id)
@@ -1022,32 +1151,40 @@ def _run_real_mode_execution(
             continue
 
         order_type = str(row.get("order_type", "LIMIT")).upper()
-        price_tick = safe_float(symbol_meta.get("price_tick") or symbol_meta.get("tickSize"))
-        entry_price = safe_float(row.get("entry_trigger"))
-        entry_price = round_tick(entry_price, price_tick) if price_tick > 0 else entry_price
+        entry_price = _normalize_price(safe_float(row.get("entry_trigger")), symbol_meta)
+
+        qty_s = _qty_to_exchange_str(qty, symbol_meta)
+        price_s = _price_to_exchange_str(entry_price, symbol_meta)
 
         try:
             client.set_leverage(symbol, CONFIG.TRADE.LEVERAGE)
+
+            log_message(
+                f"REAL_ENTRY_PREP symbol={symbol} side={row['side']} type={order_type} "
+                f"qty={qty_s} price={price_s} qty_step={_qty_step_from_meta(symbol_meta)} "
+                f"tick={_price_tick_from_meta(symbol_meta)}",
+                ORDER_LOG_FILE,
+            )
 
             if order_type == "MARKET":
                 resp = client.place_market_order(
                     symbol=symbol,
                     side=_side_to_binance(row["side"]),
-                    quantity=qty,
+                    quantity=qty_s,
                     reduce_only=False,
                 )
             else:
                 resp = client.place_limit_order(
                     symbol=symbol,
                     side=_side_to_binance(row["side"]),
-                    quantity=qty,
-                    price=entry_price,
+                    quantity=qty_s,
+                    price=price_s,
                     reduce_only=False,
                 )
 
             exchange_order_id = _response_order_id(resp)
             row["exchange_order_id"] = exchange_order_id
-            row["submitted_qty"] = round(qty, 8)
+            row["submitted_qty"] = round(safe_float(qty_s), 8)
             row["exchange_status"] = _normalize_order_status(resp.get("status", "NEW"))
             row["updated_at"] = utc_now_str()
 
@@ -1059,7 +1196,7 @@ def _run_real_mode_execution(
                 row["avg_fill_price"] = round(_response_avg_price(status_resp), 8)
 
                 if row["exchange_status"] == "FILLED":
-                    row_by_order_id[row["order_id"]] = _resolve_filled_order(client, row, status_resp)
+                    row_by_order_id[row["order_id"]] = _resolve_filled_order(client, row, status_resp, symbol_meta)
                     open_pos_symbols.add(symbol)
                 elif row["exchange_status"] in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}:
                     row["status"] = "CANCELLED" if row["exchange_status"] in {"CANCELED", "CANCELLED"} else row["exchange_status"]
@@ -1073,11 +1210,19 @@ def _run_real_mode_execution(
                 ORDER_LOG_FILE,
             )
             alert_real_order_entry(row)
+
         except Exception as e:
-            row["status"] = "FAILED_SUBMIT"
-            row["cancel_reason"] = "REAL_ENTRY_SUBMIT_EXCEPTION"
+            err = str(e)
             row["updated_at"] = utc_now_str()
-            log_message(f"REAL_ENTRY_SUBMIT_FAIL symbol={symbol} error={e}", ORDER_LOG_FILE)
+
+            if "Precision is over the maximum defined for this asset" in err:
+                row["status"] = "PRECISION_FAILED"
+                row["cancel_reason"] = "REAL_ENTRY_PRECISION_FAILED"
+            else:
+                row["status"] = "FAILED_SUBMIT"
+                row["cancel_reason"] = "REAL_ENTRY_SUBMIT_EXCEPTION"
+
+            log_message(f"REAL_ENTRY_SUBMIT_FAIL symbol={symbol} error={err}", ORDER_LOG_FILE)
 
     return all_rows
 

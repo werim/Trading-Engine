@@ -66,10 +66,10 @@ class TradeConfig:
     # Adaptive regime switches
     ENABLE_REGIME_FILTER: bool = os.getenv("ENABLE_REGIME_FILTER", "1") == "1"
     ALLOW_RANGE_PULLBACKS: bool = os.getenv("ALLOW_RANGE_PULLBACKS", "1") == "1"
-    ALLOW_RANGE_BREAKOUTS: bool = os.getenv("ALLOW_RANGE_BREAKOUTS", "0") == "1"
+    ALLOW_RANGE_BREAKOUTS: bool = os.getenv("ALLOW_RANGE_BREAKOUTS", "1") == "1"
 
     # Stricter rules during daily range
-    RANGE_SCORE_MIN: int = int(os.getenv("RANGE_SCORE_MIN", "6"))
+    RANGE_SCORE_MIN: int = int(os.getenv("RANGE_SCORE_MIN", "4"))
     RANGE_RR_MIN: float = float(os.getenv("RANGE_RR_MIN", "2.4"))
     RANGE_MIN_EXPECTED_NET_PNL_PCT: float = float(os.getenv("RANGE_MIN_EXPECTED_NET_PNL_PCT", "1.40"))
 
@@ -124,10 +124,6 @@ class FileConfig:
 
     ORDER_REJECTED_COOLDOWN_MINUTES = 30
     ORDER_FAILED_SUBMIT_COOLDOWN_MINUTES = 15
-
-    # Opsiyonel
-    ORDER_REJECTED_COOLDOWN_MINUTES = 15
-    ORDER_FAILED_SUBMIT_COOLDOWN_MINUTES = 10
 
 
 @dataclass
